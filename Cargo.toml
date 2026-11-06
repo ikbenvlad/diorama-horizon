@@ -1,0 +1,8 @@
+# Standalone workspace for developing and testing the engine without Horizon.
+# horizon-mixins stages only `mixins/diorama/engine` into Horizon's workspace.
+[workspace]
+resolver = "3"
+members = ["mixins/diorama/engine"]
+
+[profile.test]
+opt-level = 2
