@@ -71,6 +71,78 @@ impl TileKey {
 
 pub const PIXELS: usize = (TILE_PIXELS * TILE_PIXELS) as usize;
 
+/// Pixels per side of the squares a tile is baked again in, when only part of it changed.
+pub const PATCH: usize = 32;
+/// Patches per row of a tile.
+pub const PATCHES: usize = TILE_PIXELS as usize / PATCH;
+const PATCH_WORDS: usize = PATCHES * PATCHES / 64;
+
+/// Which patches of a tile are to be baked again: patch `(x, y)` is bit `y * PATCHES + x`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Patches([u64; PATCH_WORDS]);
+
+impl Patches {
+    pub const ALL: Patches = Patches([u64::MAX; PATCH_WORDS]);
+    pub const NONE: Patches = Patches([0; PATCH_WORDS]);
+
+    /// The patches from `(x0, y0)` to `(x1, y1)`, both included; the parts outside the tile are
+    /// left out.
+    pub fn rect(x0: i64, y0: i64, x1: i64, y1: i64) -> Patches {
+        let mut p = Patches::NONE;
+        let last = PATCHES as i64 - 1;
+        let (x0, x1) = (x0.max(0), x1.min(last));
+        let (y0, y1) = (y0.max(0), y1.min(last));
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let i = y as usize * PATCHES + x as usize;
+                p.0[i / 64] |= 1 << (i % 64);
+            }
+        }
+        p
+    }
+
+    pub fn contains(&self, x: usize, y: usize) -> bool {
+        let i = y * PATCHES + x;
+        self.0[i / 64] >> (i % 64) & 1 == 1
+    }
+
+    pub fn union(self, other: Patches) -> Patches {
+        Patches(std::array::from_fn(|i| self.0[i] | other.0[i]))
+    }
+
+    pub fn count(&self) -> u32 {
+        self.0.iter().map(|w| w.count_ones()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|w| *w == 0)
+    }
+
+    pub fn is_all(&self) -> bool {
+        *self == Patches::ALL
+    }
+
+    /// The patches as runs along each row: `(row, first column, one past the last)`.
+    pub fn runs(&self) -> Vec<(usize, usize, usize)> {
+        let mut out = Vec::new();
+        for y in 0..PATCHES {
+            let mut x = 0;
+            while x < PATCHES {
+                if !self.contains(x, y) {
+                    x += 1;
+                    continue;
+                }
+                let start = x;
+                while x < PATCHES && self.contains(x, y) {
+                    x += 1;
+                }
+                out.push((y, start, x));
+            }
+        }
+        out
+    }
+}
+
 /// A tile's pixels, `TILE_PIXELS` square.
 #[derive(Clone, Debug)]
 pub struct TileImage {
@@ -203,6 +275,17 @@ mod tests {
         let m = mips(&[white; 16], 4);
         assert_eq!(m.len(), 3);
         assert_eq!(m[2], vec![white]);
+    }
+
+    #[test]
+    fn patches_clip_and_run() {
+        let p = Patches::rect(-3, 2, 1, 3);
+        assert_eq!(p.count(), 4);
+        assert_eq!(p.runs(), vec![(2, 0, 2), (3, 0, 2)]);
+        let q = p.union(Patches::rect(14, 15, 99, 99));
+        assert_eq!(q.runs(), vec![(2, 0, 2), (3, 0, 2), (15, 14, 16)]);
+        assert!(Patches::rect(0, 0, 99, 99).is_all());
+        assert!(Patches::rect(20, 0, 30, 5).is_empty());
     }
 
     #[test]

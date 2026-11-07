@@ -14,20 +14,24 @@ use diorama_engine::looks::{
     self, Average, BlockLooks, FaceColor, FaceTint, Kind, StateInput, TintKind,
 };
 use diorama_engine::projection::{Facing, Projection};
+use diorama_engine::radar;
 use diorama_engine::session::{self, MapSession, SessionConfig};
+use diorama_engine::share;
 use diorama_engine::source::ChunkSource;
 use diorama_engine::style::MapStyle;
 use diorama_engine::tile::TileKey;
 use diorama_engine::view::{self, Fog, View};
 use diorama_engine::waypoint::{self, Waypoint, Waypoints};
+use diorama_engine::waypoint_ui::{self as wui, Button, EditorHit, Form, ListHit, Rect};
 use horizon_client::extras::Corner;
 use horizon_client::extras_hud::Corners;
 use horizon_client::hud::HudBatch;
-use horizon_client::mod_api::{NativeMod, NativeScreenView};
+use horizon_client::mod_api::{NativeCamera, NativeMod, NativeScreenView};
+use horizon_client::text::{ClickEvent, Style, Text};
 use horizon_world::registry::BlockStateId;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -57,6 +61,106 @@ const TOAST: Duration = Duration::from_secs(3);
 // ---------------------------------------------------------------------------------------------
 // Settings
 
+/// Minimap opacity steps in percent. Diorama's slider goes from 20 to 100 in fives
+/// (Settings.java:51-54); a button cycles these.
+const OPACITIES: [u8; 5] = [100, 80, 60, 40, 20];
+/// The player arrow's colours as 0xRRGGBB, with their names (Settings.java:258-259).
+const ARROW_COLOURS: [(u32, &str); 8] = [
+    (0x3FA9F5, "blue"),
+    (0xEF4B4B, "red"),
+    (0x62D96B, "green"),
+    (0xFFC53D, "yellow"),
+    (0xF76B15, "orange"),
+    (0x8E4EC6, "purple"),
+    (0xD6409F, "pink"),
+    (0xF2F2F2, "white"),
+];
+/// A key left unbound, as the game names it.
+const UNBOUND: &str = "key.keyboard.unknown";
+
+/// The minimap's border (Settings.java:208-212). Diorama's Minecraft frame needs its textures,
+/// which a native mod has no atlas room for, so it is left out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Frame {
+    Classic,
+    None,
+}
+
+impl Frame {
+    const ALL: [Frame; 2] = [Frame::Classic, Frame::None];
+
+    fn id(self) -> &'static str {
+        match self {
+            Frame::Classic => "classic",
+            Frame::None => "none",
+        }
+    }
+}
+
+/// How dark the map is drawn: as the world's time has it, or always by day or at night
+/// (Settings.java:201-205).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DayNight {
+    Follow,
+    Day,
+    Night,
+}
+
+impl DayNight {
+    const ALL: [DayNight; 3] = [DayNight::Follow, DayNight::Day, DayNight::Night];
+
+    fn id(self) -> &'static str {
+        match self {
+            DayNight::Follow => "follow",
+            DayNight::Day => "day",
+            DayNight::Night => "night",
+        }
+    }
+}
+
+/// How the time of day under the minimap reads, as Xaero's Minimap offers it
+/// (Settings.java:192-198, without OFF, which is the clock setting).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ClockFormat {
+    Day24h,
+    Day12h,
+    Only24h,
+    Only12h,
+}
+
+impl ClockFormat {
+    const ALL: [ClockFormat; 4] = [
+        ClockFormat::Day24h,
+        ClockFormat::Day12h,
+        ClockFormat::Only24h,
+        ClockFormat::Only12h,
+    ];
+
+    fn id(self) -> &'static str {
+        match self {
+            ClockFormat::Day24h => "day_24h",
+            ClockFormat::Day12h => "day_12h",
+            ClockFormat::Only24h => "only_24h",
+            ClockFormat::Only12h => "only_12h",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ClockFormat::Day24h => "Day, 24h",
+            ClockFormat::Day12h => "Day, 12h",
+            ClockFormat::Only24h => "24h",
+            ClockFormat::Only12h => "12h",
+        }
+    }
+}
+
+/// The item after `now` in `all`, round to the first.
+fn cycle<T: Copy + PartialEq>(all: &[T], now: T) -> T {
+    let i = all.iter().position(|x| *x == now).map_or(0, |i| i + 1);
+    all[i % all.len()]
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Settings {
     pub minimap: bool,
@@ -71,6 +175,27 @@ pub(super) struct Settings {
     pub pins: bool,
     /// A pin where the player dies.
     pub deaths: bool,
+    /// Waypoints floating in the world.
+    pub world_pins: bool,
+    /// Players and mobs on the maps.
+    pub radar: bool,
+    /// Dropped items on the maps too.
+    pub radar_items: bool,
+    /// The biome under the minimap.
+    pub biome: bool,
+    /// The time of day under the minimap.
+    pub clock: bool,
+    /// The chunk grid on the fullscreen map.
+    pub grid: bool,
+    /// How opaque the minimap's map is, in percent: one of [`OPACITIES`].
+    pub opacity: u8,
+    pub frame: Frame,
+    /// The compass letters round the minimap.
+    pub compass: bool,
+    pub day_night: DayNight,
+    /// Index into [`ARROW_COLOURS`].
+    pub arrow_colour: usize,
+    pub clock_format: ClockFormat,
 }
 
 impl Default for Settings {
@@ -86,6 +211,18 @@ impl Default for Settings {
             coordinates: true,
             pins: true,
             deaths: true,
+            world_pins: true,
+            radar: true,
+            radar_items: true,
+            biome: true,
+            clock: false,
+            grid: false,
+            opacity: 100,
+            frame: Frame::Classic,
+            compass: true,
+            day_night: DayNight::Follow,
+            arrow_colour: 0,
+            clock_format: ClockFormat::Day24h,
         }
     }
 }
@@ -117,6 +254,36 @@ impl Settings {
             coordinates: flag("coordinates", d.coordinates),
             pins: flag("pins", d.pins),
             deaths: flag("deaths", d.deaths),
+            world_pins: flag("world_pins", d.world_pins),
+            radar: flag("radar", d.radar),
+            radar_items: flag("radar_items", d.radar_items),
+            biome: flag("biome", d.biome),
+            clock: flag("clock", d.clock),
+            grid: flag("grid", d.grid),
+            // The nearest step to a saved percentage, as Settings.snapOpacity does.
+            opacity: get("opacity")
+                .and_then(|o| o.parse::<f64>().ok())
+                .and_then(|o| {
+                    OPACITIES.iter().copied().min_by(|a, b| {
+                        (f64::from(*a) - o)
+                            .abs()
+                            .total_cmp(&(f64::from(*b) - o).abs())
+                    })
+                })
+                .unwrap_or(d.opacity),
+            frame: get("frame")
+                .and_then(|f| Frame::ALL.into_iter().find(|k| k.id() == f))
+                .unwrap_or(d.frame),
+            compass: flag("compass", d.compass),
+            day_night: get("day_night")
+                .and_then(|f| DayNight::ALL.into_iter().find(|k| k.id() == f))
+                .unwrap_or(d.day_night),
+            arrow_colour: get("arrow_colour")
+                .and_then(|c| ARROW_COLOURS.iter().position(|(_, n)| *n == c))
+                .unwrap_or(d.arrow_colour),
+            clock_format: get("clock_format")
+                .and_then(|f| ClockFormat::ALL.into_iter().find(|k| k.id() == f))
+                .unwrap_or(d.clock_format),
         }
     }
 
@@ -138,6 +305,21 @@ impl Settings {
             ("coordinates", self.coordinates.to_string()),
             ("pins", self.pins.to_string()),
             ("deaths", self.deaths.to_string()),
+            ("world_pins", self.world_pins.to_string()),
+            ("radar", self.radar.to_string()),
+            ("radar_items", self.radar_items.to_string()),
+            ("biome", self.biome.to_string()),
+            ("clock", self.clock.to_string()),
+            ("grid", self.grid.to_string()),
+            ("opacity", self.opacity.to_string()),
+            ("frame", self.frame.id().to_owned()),
+            ("compass", self.compass.to_string()),
+            ("day_night", self.day_night.id().to_owned()),
+            (
+                "arrow_colour",
+                ARROW_COLOURS[self.arrow_colour].1.to_owned(),
+            ),
+            ("clock_format", self.clock_format.id().to_owned()),
         ]
     }
 
@@ -160,7 +342,40 @@ impl Settings {
             format!("Coordinates: {}", on(self.coordinates)),
             format!("Waypoints on minimap: {}", on(self.pins)),
             format!("Death pins: {}", on(self.deaths)),
+            format!("Waypoints in the world: {}", on(self.world_pins)),
+            format!("Radar: {}", on(self.radar)),
+            format!("Radar items: {}", on(self.radar_items)),
+            format!("Biome: {}", on(self.biome)),
+            format!("Time of day: {}", on(self.clock)),
+            format!("Chunk grid on the map: {}", on(self.grid)),
+            format!("Minimap opacity: {}%", self.opacity),
+            format!(
+                "Frame: {}",
+                match self.frame {
+                    Frame::Classic => "Classic",
+                    Frame::None => "None",
+                }
+            ),
+            format!("Compass: {}", on(self.compass)),
+            format!(
+                "Day and night: {}",
+                match self.day_night {
+                    DayNight::Follow => "World time",
+                    DayNight::Day => "Always day",
+                    DayNight::Night => "Always night",
+                }
+            ),
+            format!("Arrow colour: {}", {
+                let name = ARROW_COLOURS[self.arrow_colour].1;
+                name[..1].to_uppercase() + &name[1..]
+            }),
+            format!("Time format: {}", self.clock_format.label()),
         ]
+    }
+
+    /// How opaque the minimap draws, 0 to 1.
+    fn opacity(&self) -> f32 {
+        f32::from(self.opacity) / 100.0
     }
 
     fn click(&mut self, i: usize) {
@@ -175,6 +390,18 @@ impl Settings {
             7 => self.coordinates = !self.coordinates,
             8 => self.pins = !self.pins,
             9 => self.deaths = !self.deaths,
+            10 => self.world_pins = !self.world_pins,
+            11 => self.radar = !self.radar,
+            12 => self.radar_items = !self.radar_items,
+            13 => self.biome = !self.biome,
+            14 => self.clock = !self.clock,
+            15 => self.grid = !self.grid,
+            16 => self.opacity = cycle(&OPACITIES, self.opacity),
+            17 => self.frame = cycle(&Frame::ALL, self.frame),
+            18 => self.compass = !self.compass,
+            19 => self.day_night = cycle(&DayNight::ALL, self.day_night),
+            20 => self.arrow_colour = (self.arrow_colour + 1) % ARROW_COLOURS.len(),
+            21 => self.clock_format = cycle(&ClockFormat::ALL, self.clock_format),
             _ => {}
         }
     }
@@ -310,6 +537,22 @@ struct State {
     dead: bool,
     /// A note on the fullscreen map, and when it was made.
     toast: Option<(String, Instant)>,
+    /// The list or editor over the fullscreen map.
+    panel: Panel,
+    /// Where the left button went down on the map, and whether it has moved far since.
+    press: Option<([f32; 2], bool)>,
+    /// What the next frame sends or does for the screen hooks.
+    outbox: Vec<Outgoing>,
+    /// Where this world's maps are kept.
+    map_root: Option<PathBuf>,
+    /// Another dimension's saved map, shown on the fullscreen map instead of this one's.
+    viewing: Option<Viewer>,
+}
+
+/// Another dimension's map, read from what was saved of it: nothing bakes.
+struct Viewer {
+    dimension: String,
+    session: MapSession,
 }
 
 impl State {
@@ -338,7 +581,37 @@ impl State {
             dimension: String::new(),
             dead: false,
             toast: None,
+            panel: Panel::None,
+            press: None,
+            outbox: Vec::new(),
+            map_root: None,
+            viewing: None,
         }
+    }
+
+    /// The map the fullscreen map shows: another dimension's, or the player's.
+    fn map_session(&self) -> Option<&MapSession> {
+        match &self.viewing {
+            Some(v) => Some(&v.session),
+            None => self.session.as_ref(),
+        }
+    }
+
+    /// The dimension the fullscreen map shows.
+    fn map_dimension(&self) -> &str {
+        self.viewing
+            .as_ref()
+            .map_or(&self.dimension, |v| &v.dimension)
+    }
+
+    /// The waypoints shown in the dimension the fullscreen map shows.
+    fn map_pins(&self) -> Vec<(usize, Waypoint)> {
+        let dimension = self.map_dimension();
+        self.waypoints.as_ref().map_or_else(Vec::new, |ws| {
+            ws.shown_in(dimension)
+                .map(|(i, w)| (i, w.clone()))
+                .collect()
+        })
     }
 
     /// The waypoints shown in the player's dimension, with their indices.
@@ -378,6 +651,7 @@ impl State {
             }
         }
         self.session_key = None;
+        self.viewing = None;
         self.converter = None;
         self.tracked.clear();
         self.shown = None;
@@ -420,6 +694,11 @@ pub(super) fn list(mods: &mut Vec<NativeMod>) {
             key("zoom_in", "Zoom the minimap in", "key.keyboard.equal"),
             key("zoom_out", "Zoom the minimap out", "key.keyboard.minus"),
             key("waypoint", "Add a waypoint here", "key.keyboard.b"),
+            key("waypoints", "List your waypoints", "key.keyboard.u"),
+            // Unbound until the player picks keys, as in Diorama (DioramaClient.java:42-46).
+            key("toggle_minimap", "Show or hide the minimap", UNBOUND),
+            key("enlarge_minimap", "Enlarge the minimap", UNBOUND),
+            key("map_dimension", "Toggle the map's dimension", UNBOUND),
         ],
     });
 }
@@ -468,7 +747,12 @@ pub(super) fn key(game: &mut Game<'_>, key: &str, pressed: bool) {
     let zoom_in = game.native_mod_key(ID, "zoom_in", "key.keyboard.equal");
     let zoom_out = game.native_mod_key(ID, "zoom_out", "key.keyboard.minus");
     let add = game.native_mod_key(ID, "waypoint", "key.keyboard.b");
+    let list = game.native_mod_key(ID, "waypoints", "key.keyboard.u");
+    let toggle = game.native_mod_key(ID, "toggle_minimap", UNBOUND);
     let player = game.native_player();
+    if key == UNBOUND {
+        return;
+    }
     if key == add {
         let Some(p) = player else { return };
         let at = [p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32];
@@ -482,17 +766,29 @@ pub(super) fn key(game: &mut Game<'_>, key: &str, pressed: bool) {
         return;
     }
     let stored = with_state(game, |s| {
-        if key == map {
+        if key == map || key == list {
             if let (Some(p), Some(session)) = (player, s.session.as_ref()) {
                 s.map.center = session.uv([p.x, p.y, p.z]);
             }
             s.map.follow = true;
             s.map.dragging = false;
+            s.press = None;
+            s.viewing = None;
+            s.shown = None;
+            s.panel = if key == list {
+                Panel::List { scroll: 0 }
+            } else {
+                Panel::None
+            };
             s.open_map = true;
             None
         } else if key == zoom_in || key == zoom_out {
             let step = s.settings.zoom as i32 + if key == zoom_in { 1 } else { -1 };
             s.settings.zoom = step.clamp(0, ZOOMS.len() as i32 - 1) as usize;
+            Some(s.settings.stored())
+        } else if key == toggle {
+            s.settings.minimap = !s.settings.minimap;
+            s.shown = None;
             Some(s.settings.stored())
         } else {
             None
@@ -503,9 +799,47 @@ pub(super) fn key(game: &mut Game<'_>, key: &str, pressed: bool) {
             game.native_set_setting(ID, k, &v);
         }
     }
+    open_map_if_asked(game);
+}
+
+/// Opens the map screen if a key or command asked for it.
+fn open_map_if_asked(game: &mut Game<'_>) {
     let open = with_state(game, |s| std::mem::take(&mut s.open_map));
     if open && !game.native_mod_screen_open(ID) {
         log::debug!("Diorama: the map can't open over this screen");
+    }
+}
+
+/// Sends what the screen hooks asked for: chat lines, teleports, closing the map.
+fn send_outbox(game: &mut Game<'_>) {
+    let out = with_state(game, |s| std::mem::take(&mut s.outbox));
+    for o in out {
+        let sent = match o {
+            Outgoing::Chat(line) => game.native_send_chat(&line),
+            Outgoing::Teleport {
+                at: [x, y, z],
+                dimension,
+            } => game
+                .native_send_chat(&format!("/execute in {dimension} run tp @s {x} {y} {z}"))
+                .or_else(|e| {
+                    // In single player there is no server connection; the game's own server
+                    // runs it, for its player.
+                    let line =
+                        format!("execute as @a[limit=1] in {dimension} run tp @s {x} {y} {z}");
+                    if game.native_run_command(&line) {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                }),
+            Outgoing::Close => {
+                game.native_mod_screen_close(ID);
+                Ok(())
+            }
+        };
+        if let Err(e) = sent {
+            game.native_chat(&format!("Diorama: couldn't send that: {e}"));
+        }
     }
 }
 
@@ -544,6 +878,50 @@ fn default_fog(dimension: &str) -> u32 {
     }
 }
 
+/// Where a dimension's map is kept under a world's map folder, for a facing and the style.
+fn map_folder(root: &Path, dimension: &str, facing: Facing) -> PathBuf {
+    root.join(sanitize(dimension)).join(format!(
+        "{}-{:08x}",
+        facing.id(),
+        MapStyle::DEFAULT.fingerprint()
+    ))
+}
+
+/// The file in a dimension's folder that names it, as its folder name can't.
+const DIMENSION_FILE: &str = "dimension.txt";
+
+/// The dimensions of a world that have a map from `facing`: the Overworld, the Nether and the
+/// End first, then the others by name.
+fn mapped_dimensions(root: &Path, facing: Facing) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(root)
+        .map(|dir| {
+            dir.flatten()
+                .filter_map(|e| std::fs::read_to_string(e.path().join(DIMENSION_FILE)).ok())
+                .map(|id| id.trim().to_owned())
+                .filter(|id| map_folder(root, id, facing).is_dir())
+                .collect()
+        })
+        .unwrap_or_default();
+    let rank = |d: &str| match d {
+        "minecraft:overworld" => 0,
+        "minecraft:the_nether" => 1,
+        "minecraft:the_end" => 2,
+        _ => 3,
+    };
+    out.sort_by(|a, b| rank(a).cmp(&rank(b)).then(a.cmp(b)));
+    out.dedup();
+    out
+}
+
+/// Blocks of the Overworld per block of a dimension: 8 for the Nether.
+fn coordinate_scale(dimension: &str) -> f64 {
+    if dimension == "minecraft:the_nether" {
+        8.0
+    } else {
+        1.0
+    }
+}
+
 fn tick(game: &mut Game<'_>) {
     if !game.native_on(ID) || !game.native_window() {
         return;
@@ -558,7 +936,9 @@ fn tick(game: &mut Game<'_>) {
     let generation = game.native_block_sprites_version();
     let data = game.native_data_dir(ID);
     let dead = game.screen == super::Screen::Dead;
+    let root = data.join("maps").join(&world);
     let death = with_state(game, |s| {
+        s.map_root = Some(root.clone());
         if s.waypoints_world.as_deref() != Some(world.as_str()) {
             s.waypoints = Some(Waypoints::load(
                 data.join("maps").join(&world).join("waypoints.txt"),
@@ -630,11 +1010,14 @@ fn tick(game: &mut Game<'_>) {
             && let Some(looks) = s.looks.clone()
         {
             let style = MapStyle::DEFAULT;
-            let folder: PathBuf = data.join("maps").join(&key).join(format!(
-                "{}-{:08x}",
-                s.settings.facing.id(),
-                style.fingerprint()
-            ));
+            let folder = map_folder(&root, &dimension, s.settings.facing);
+            // Named, so the map of another dimension can show this one.
+            let named = root.join(sanitize(&dimension));
+            if let Err(e) = std::fs::create_dir_all(&named)
+                .and_then(|()| std::fs::write(named.join(DIMENSION_FILE), &dimension))
+            {
+                log::warn!("Diorama: naming the map folder: {e}");
+            }
             let roof = shape
                 .has_ceiling
                 .then_some(shape.min_y + shape.logical_height);
@@ -1070,6 +1453,7 @@ pub(super) fn frame(game: &mut Game<'_>, _elapsed: Duration) {
     if !game.native_on(ID) {
         return;
     }
+    send_outbox(game);
     let due = with_state(game, |s| {
         let now = Instant::now();
         let due = s.last_tick.is_none_or(|t| now.duration_since(t) >= TICK);
@@ -1093,12 +1477,14 @@ pub(super) fn frame(game: &mut Game<'_>, _elapsed: Duration) {
         let settings = s.settings;
         let underground = s.underground;
         let time = now.duration_since(s.started).as_secs_f64();
-        let session = s.session.as_mut()?;
-        session.tick(now, [player.x, player.y, player.z]);
-        let here = session.uv([player.x, player.y, player.z]);
-        let cave = session.cave_layer();
+        let own = s.session.as_mut()?;
+        own.tick(now, [player.x, player.y, player.z]);
+        let here = own.uv([player.x, player.y, player.z]);
+        let cave = own
+            .cave_layer()
+            .filter(|_| s.viewing.is_none() || !fullscreen);
         let view = if fullscreen {
-            if s.map.follow {
+            if s.map.follow && s.viewing.is_none() {
                 s.map.center = here;
             }
             let fit = (f64::from(IMAGE_MAX) / f64::from(physical[0]))
@@ -1147,6 +1533,13 @@ pub(super) fn frame(game: &mut Game<'_>, _elapsed: Duration) {
                 round: settings.round,
             }
         };
+        let session = match s.viewing.as_mut() {
+            Some(v) if fullscreen => {
+                v.session.tick(now, [player.x, player.y, player.z]);
+                &mut v.session
+            }
+            _ => s.session.as_mut()?,
+        };
         let version = session.cache_version();
         let fresh = s.shown.as_ref().is_none_or(|sh| {
             sh.fullscreen != fullscreen
@@ -1166,8 +1559,14 @@ pub(super) fn frame(game: &mut Game<'_>, _elapsed: Duration) {
         } else {
             Fog { time, ..Fog::CAVE }
         };
+        // The minimap is as see-through as the settings say; the fullscreen map stays opaque
+        // (MapViewport.java:133-140).
+        let mut look = session.look(view.layer);
+        if !fullscreen {
+            look.opacity = settings.opacity();
+        }
         s.pixels.resize(view.width * view.height, 0);
-        session.compose(&view, &fog, &mut s.pixels);
+        session.compose(&view, &look, Some(&fog), &mut s.pixels);
         view::to_rgba(&s.pixels, &mut s.rgba);
         s.shown = Some(Shown {
             fullscreen,
@@ -1261,6 +1660,220 @@ fn draw_pin(
     b
 }
 
+/// How far above or below the player the radar looks, in blocks.
+const RADAR_RANGE: f64 = 32.0;
+
+/// The players, mobs and dropped items the radar shows: all but the player and what can't be
+/// seen.
+fn radar_entities(game: &Game<'_>, items: bool, me: [f64; 3]) -> Vec<radar::Entity> {
+    let mut out: Vec<radar::Entity> = game
+        .mobs
+        .iter()
+        .filter(|m| {
+            !m.removed && m.alive() && !m.invisible && !m.has_effect("minecraft:invisibility")
+        })
+        .filter_map(|m| {
+            let kind = radar::kind(&m.kind.id, &m.kind.category)?;
+            let pos = [m.position.x, m.position.y, m.position.z];
+            let player = kind == radar::Kind::Player;
+            if player
+                && (pos[0] - me[0]).hypot(pos[2] - me[2]) < 0.3
+                && (pos[1] - me[1]).abs() < 0.5
+            {
+                return None;
+            }
+            let name = player
+                .then(|| game.remote_player_name(m.id).map(str::to_owned))
+                .flatten();
+            Some(radar::Entity { kind, pos, name })
+        })
+        .collect();
+    if items {
+        out.extend(game.dropped.iter().map(|i| radar::Entity {
+            kind: radar::Kind::Item,
+            pos: [i.position.x, i.position.y, i.position.z],
+            name: None,
+        }));
+    }
+    out
+}
+
+/// Draws radar dots placed in an image shown at `origin` with `scale` GUI pixels per image pixel.
+/// `size` is a dot's side by kind; players' names show beside them when `names`.
+#[allow(clippy::too_many_arguments)]
+fn draw_blips(
+    game: &Game<'_>,
+    batch: &mut HudBatch,
+    blips: &[radar::Blip],
+    entities: &[radar::Entity],
+    origin: [f32; 2],
+    scale: f32,
+    size: impl Fn(radar::Kind) -> f32,
+    names: bool,
+) {
+    for b in blips {
+        let s = size(b.kind);
+        let (x, y) = (
+            origin[0] + b.x as f32 * scale,
+            origin[1] + b.y as f32 * scale,
+        );
+        let (x0, y0) = ((x - s / 2.0).round(), (y - s / 2.0).round());
+        // Well above or below: faded, with a mark on the side it is.
+        let far = b.dy.abs() > radar::CARET_HEIGHT;
+        let alpha: u32 = if far { 0xB0 } else { 0xFF };
+        game.native_fill(
+            batch,
+            [x0 - 1.0, y0 - 1.0, s + 2.0, s + 2.0],
+            (alpha << 24) | 0x10_1418,
+        );
+        game.native_fill(
+            batch,
+            [x0, y0, s, s],
+            (alpha << 24) | (b.kind.color() & 0xFF_FFFF),
+        );
+        if far && b.kind != radar::Kind::Item {
+            let cx = (x - 0.5).round();
+            let (tip, base) = if b.dy > 0.0 {
+                (y0 - 4.0, y0 - 3.0)
+            } else {
+                (y0 + s + 3.0, y0 + s + 2.0)
+            };
+            game.native_fill(batch, [cx, tip, 1.0, 1.0], 0xFFFF_FFFF);
+            game.native_fill(batch, [cx - 1.0, base, 3.0, 1.0], 0xFFFF_FFFF);
+        }
+        if names && let Some(name) = &entities[b.index].name {
+            game.native_text(
+                batch,
+                name,
+                [x0 + s + 3.0, y0 + s / 2.0 - 4.0],
+                0xFFFFFF,
+                true,
+            );
+        }
+    }
+}
+
+/// A biome or dimension id for people: `minecraft:dark_forest` is Dark Forest.
+fn pretty_id(id: &str) -> String {
+    id.rsplit(':')
+        .next()
+        .unwrap_or(id)
+        .split(['_', '/'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            c.next()
+                .map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The biome at a world position, from the client's chunks.
+fn biome_at(game: &Game<'_>, p: [f64; 3]) -> Option<String> {
+    let (x, y, z) = (
+        p[0].floor() as i32,
+        p[1].floor() as i32,
+        p[2].floor() as i32,
+    );
+    let chunk = game.world.chunks.get(&(x >> 4, z >> 4))?;
+    let id = chunk.biome(x & 15, y, z & 15);
+    Some(pretty_id(&game.pack.context.biomes.get(id).name))
+}
+
+/// The time of day as Xaero's Minimap writes it (MinimapHud.gameTime, MinimapHud.java:310-323):
+/// day time 0 is 06:00 on day 1, and a new day starts at midnight.
+fn clock_text(format: ClockFormat, day_time: i64) -> String {
+    let since_midnight = day_time + 6000;
+    let day = since_midnight.div_euclid(24_000) + 1;
+    let t = since_midnight.rem_euclid(24_000);
+    let (hour, minute) = (t / 1000, t % 1000 * 60 / 1000);
+    let twelve = matches!(format, ClockFormat::Day12h | ClockFormat::Only12h);
+    let time = if twelve {
+        let h = if hour % 12 == 0 { 12 } else { hour % 12 };
+        format!("{h:02}:{minute:02} {}", if hour < 12 { "AM" } else { "PM" })
+    } else {
+        format!("{hour:02}:{minute:02}")
+    };
+    if matches!(format, ClockFormat::Day24h | ClockFormat::Day12h) {
+        format!("Day {day}, {time}")
+    } else {
+        time
+    }
+}
+
+/// Where a world point shows on screen through `camera`, in GUI pixels of a screen `size`
+/// across; none behind the camera.
+fn project(camera: &NativeCamera, p: [f64; 3], size: [f32; 2]) -> Option<[f32; 2]> {
+    let rel = [
+        (p[0] - camera.position[0]) as f32,
+        (p[1] - camera.position[1]) as f32,
+        (p[2] - camera.position[2]) as f32,
+        1.0,
+    ];
+    // Column-major 4x4 times a column vector.
+    let mul = |m: &[f32; 16], v: [f32; 4]| -> [f32; 4] {
+        std::array::from_fn(|row| (0..4).map(|col| m[col * 4 + row] * v[col]).sum())
+    };
+    let clip = mul(&camera.projection, mul(&camera.view, rel));
+    if clip[3] <= 1e-3 {
+        return None;
+    }
+    let (nx, ny) = (clip[0] / clip[3], clip[1] / clip[3]);
+    Some([(nx * 0.5 + 0.5) * size[0], (0.5 - ny * 0.5) * size[1]])
+}
+
+/// Waypoints floating in the world, a pin on each with its distance under it, and its name too
+/// for the one nearest the crosshair. Far ones first, so near ones are drawn over them.
+fn world_pins(
+    game: &Game<'_>,
+    batch: &mut HudBatch,
+    pins: &[(usize, Waypoint)],
+    dimension: &str,
+    size: [f32; 2],
+) {
+    let Some(camera) = game.native_camera() else {
+        return;
+    };
+    if camera.dimension != dimension {
+        return;
+    }
+    let mut placed: Vec<(f64, [f32; 2], &Waypoint)> = pins
+        .iter()
+        .filter_map(|(_, w)| {
+            let [x, y, z] = w.point();
+            let at = project(&camera, [x, y + 1.0, z], size)?;
+            let on_screen = (0.0..size[0]).contains(&at[0]) && (0.0..size[1]).contains(&at[1]);
+            on_screen.then(|| (w.distance_to(camera.position), at, w))
+        })
+        .collect();
+    placed.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let centre = [size[0] / 2.0, size[1] / 2.0];
+    let aimed = placed
+        .iter()
+        .map(|(_, at, _)| (at[0] - centre[0]).hypot(at[1] - centre[1]))
+        .enumerate()
+        .filter(|(_, d)| *d < 20.0)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i);
+    for (i, (d, at, w)) in placed.iter().enumerate() {
+        draw_pin(game, batch, w, *at, false, false);
+        let text = if Some(i) == aimed {
+            format!("{} ({d:.0} m)", w.name)
+        } else {
+            format!("{d:.0} m")
+        };
+        let tw = game.native_text_width(&text);
+        let ty = at[1] + 3.0;
+        game.native_fill(
+            batch,
+            [at[0] - tw / 2.0 - 2.0, ty - 1.0, tw + 4.0, 10.0],
+            0x8000_0000,
+        );
+        game.native_text(batch, &text, [at[0] - tw / 2.0, ty], 0xFFFFFF, false);
+    }
+}
+
 /// The minimap in its corner of the HUD.
 pub(super) fn hud(game: &mut Game<'_>, batch: &mut HudBatch, corners: &mut Corners) {
     if !game.native_on(ID) || game.native_mod_screen() == Some(ID) {
@@ -1269,6 +1882,15 @@ pub(super) fn hud(game: &mut Game<'_>, batch: &mut HudBatch, corners: &mut Corne
     let Some(player) = game.native_player() else {
         return;
     };
+    let world = with_state(game, |s| {
+        s.settings
+            .world_pins
+            .then(|| (s.pins(), s.dimension.clone()))
+    });
+    if let Some((pins, dimension)) = world {
+        let size = [batch.width, batch.height];
+        world_pins(game, batch, &pins, &dimension, size);
+    }
     let shown = with_state(game, |s| {
         let sh = s.shown.filter(|sh| !sh.fullscreen && s.settings.minimap)?;
         Some((
@@ -1291,10 +1913,31 @@ pub(super) fn hud(game: &mut Game<'_>, batch: &mut HudBatch, corners: &mut Corne
         return;
     }
     let size = SIZES[settings.size];
-    let text_h = if settings.coordinates { 10.0 } else { 0.0 };
+    let here = [player.x, player.y, player.z];
+    let mut lines = Vec::new();
+    if settings.coordinates {
+        lines.push(format!(
+            "{} {} {}{}",
+            player.x.floor() as i64,
+            player.y.floor() as i64,
+            player.z.floor() as i64,
+            if underground { " (cave)" } else { "" }
+        ));
+    }
+    if settings.biome
+        && let Some(biome) = biome_at(game, here)
+    {
+        lines.push(biome);
+    }
+    if settings.clock
+        && let Some(clock) = game.native_clock()
+    {
+        lines.push(clock_text(settings.clock_format, clock.day_time));
+    }
+    let text_h = 10.0 * lines.len() as f32;
     let (x, y) = corners.place(corner, size, size + text_h);
     let map_y = if corner.top() { y } else { y + text_h };
-    if !settings.round {
+    if !settings.round && settings.frame != Frame::None {
         game.native_fill(
             batch,
             [x - 1.0, map_y - 1.0, size + 2.0, size + 2.0],
@@ -1316,18 +1959,46 @@ pub(super) fn hud(game: &mut Game<'_>, batch: &mut HudBatch, corners: &mut Corne
         Facing::West => "W",
     };
     let (mx, my, half) = (x + size / 2.0, map_y + size / 2.0, size / 2.0 - 5.0);
-    for (turn, (dx, dy)) in [(0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)]
-        .into_iter()
-        .enumerate()
-    {
+    let compass: &[(f32, f32)] = if settings.compass {
+        &[(0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)]
+    } else {
+        &[]
+    };
+    for (turn, &(dx, dy)) in compass.iter().enumerate() {
         let text = letter(projection.facing.next(turn as i32));
         let tw = game.native_text_width(text);
         let at = [mx + dx * half - tw / 2.0, my + dy * half - 4.0];
         let rgb = if turn == 0 { 0xFF_5555 } else { 0xE0_E0E0 };
         game.native_text(batch, text, at, rgb, true);
     }
-    // Waypoints: where they are, or held at the edge toward them.
     let per_px = img[0] / size;
+    if settings.radar {
+        let entities = radar_entities(game, settings.radar_items, here);
+        let blips = radar::place(
+            &shown.view,
+            &projection,
+            &entities,
+            player.y,
+            RADAR_RANGE,
+            0.0,
+        );
+        let size_of = |k: radar::Kind| match k {
+            radar::Kind::Item => 2.0,
+            radar::Kind::Player => 5.0,
+            _ => 3.0,
+        };
+        draw_blips(
+            game,
+            batch,
+            &blips,
+            &entities,
+            [x, map_y],
+            1.0 / per_px,
+            size_of,
+            false,
+        );
+    }
+    // Waypoints: where they are, or held at the edge toward them.
     let inset = f64::from((PIN_H / 2.0 + 1.0) * per_px);
     for (_, w) in &pins {
         let [px, py, pz] = w.point();
@@ -1345,17 +2016,309 @@ pub(super) fn hud(game: &mut Game<'_>, batch: &mut HudBatch, corners: &mut Corne
         projection.facing,
         8.0,
     );
-    if settings.coordinates {
-        let text = format!(
-            "{} {} {}{}",
-            player.x.floor() as i64,
-            player.y.floor() as i64,
-            player.z.floor() as i64,
-            if underground { " (cave)" } else { "" }
+    let top = if corner.top() { map_y + size + 2.0 } else { y };
+    for (i, text) in lines.iter().enumerate() {
+        let w = game.native_text_width(text);
+        let ty = top + 10.0 * i as f32;
+        game.native_text(batch, text, [x + (size - w) / 2.0, ty], 0xFFFFFF, true);
+    }
+}
+
+/// What the fullscreen map shows over itself.
+#[derive(Clone, Debug, Default)]
+enum Panel {
+    #[default]
+    None,
+    /// The waypoint list, from row `scroll`.
+    List { scroll: usize },
+    /// A waypoint's editor, and when the waypoint was made, to tell it is still the same one.
+    Edit(Form, u64),
+}
+
+/// What the frame does for the screen hooks, which only read the game.
+enum Outgoing {
+    /// A chat line, or a command (`/` first), to the server.
+    Chat(String),
+    /// The player to a place, in a dimension.
+    Teleport { at: [i32; 3], dimension: String },
+    /// The map screen closes.
+    Close,
+}
+
+const PANEL_BG: u32 = 0xEC14_171C;
+const PANEL_EDGE: u32 = 0xFF3A_404A;
+const BUTTON_BG: u32 = 0xFF2A_2F38;
+const BUTTON_HOVER: u32 = 0xFF41_4858;
+/// The map screen's button to the waypoint list, in its top right corner.
+fn list_button(size: [f32; 2]) -> Rect {
+    const W: f32 = 92.0;
+    [size[0] - W - 6.0, 6.0, W, wui::BUTTON_H]
+}
+
+/// The map screen's button to show another dimension's map, left of the list button.
+fn dimension_button(size: [f32; 2]) -> Rect {
+    let list = list_button(size);
+    const W: f32 = 120.0;
+    [list[0] - W - 6.0, list[1], W, list[3]]
+}
+
+/// Shows the next mapped dimension on the fullscreen map, about the same place in it.
+fn switch_dimension(s: &mut State) {
+    let Some(root) = s.map_root.clone() else {
+        return;
+    };
+    let facing = s.settings.facing;
+    let mut dims = mapped_dimensions(&root, facing);
+    if !dims.contains(&s.dimension) {
+        dims.insert(0, s.dimension.clone());
+    }
+    let current = s.map_dimension().to_owned();
+    let next = dims[dims
+        .iter()
+        .position(|d| *d == current)
+        .map_or(0, |i| (i + 1) % dims.len())]
+    .clone();
+    if next == current {
+        s.toast = Some((
+            "No other dimension is mapped yet".to_owned(),
+            Instant::now(),
+        ));
+        return;
+    }
+    // The world point at the map's middle, at sea level, in the next dimension's coordinates.
+    let centre = s.map_session().map(|se| {
+        let (x, z) = se
+            .projection()
+            .world_at(s.map.center.0, s.map.center.1, 64.0);
+        let k = coordinate_scale(&current) / coordinate_scale(&next);
+        [x * k, 64.0, z * k]
+    });
+    s.viewing = None;
+    if next != s.dimension {
+        let session = MapSession::new(SessionConfig {
+            folder: map_folder(&root, &next, facing),
+            min_y: -64,
+            max_y: 320,
+            roof: None,
+            style: MapStyle::DEFAULT,
+            facing,
+            fast: s.settings.fast,
+            threads: 1,
+        });
+        s.viewing = Some(Viewer {
+            dimension: next.clone(),
+            session,
+        });
+    }
+    if let (Some(c), Some(se)) = (centre, s.map_session()) {
+        s.map.center = se.uv(c);
+    }
+    s.map.follow = false;
+    s.map.caves = false;
+    s.shown = None;
+    s.toast = Some((
+        format!("Showing the {}", dimension_name(&next)),
+        Instant::now(),
+    ));
+}
+
+fn panel(game: &Game<'_>, batch: &mut HudBatch, r: Rect) {
+    game.native_fill(
+        batch,
+        [r[0] - 1.0, r[1] - 1.0, r[2] + 2.0, r[3] + 2.0],
+        PANEL_EDGE,
+    );
+    game.native_fill(batch, r, PANEL_BG);
+}
+
+fn button(game: &Game<'_>, batch: &mut HudBatch, r: Rect, label: &str, mouse: [f32; 2]) {
+    let bg = if wui::inside(r, mouse) {
+        BUTTON_HOVER
+    } else {
+        BUTTON_BG
+    };
+    game.native_fill(batch, r, bg);
+    let tw = game.native_text_width(label);
+    game.native_text(
+        batch,
+        label,
+        [r[0] + (r[2] - tw) / 2.0, r[1] + (r[3] - 8.0) / 2.0],
+        0xFFFFFF,
+        true,
+    );
+}
+
+/// The end of `text` that fits in `width` GUI pixels, or its start with `…` when `head`.
+fn fit(game: &Game<'_>, text: &str, width: f32, head: bool) -> String {
+    if game.native_text_width(text) <= width {
+        return text.to_owned();
+    }
+    let mut chars: Vec<char> = text.chars().collect();
+    while !chars.is_empty() {
+        if head {
+            chars.pop();
+            let t: String = chars.iter().collect::<String>() + "…";
+            if game.native_text_width(&t) <= width {
+                return t;
+            }
+        } else {
+            chars.remove(0);
+            let t: String = chars.iter().collect();
+            if game.native_text_width(&t) <= width {
+                return t;
+            }
+        }
+    }
+    String::new()
+}
+
+/// A dimension's name for people: Overworld, Nether, End, or a modded one's path.
+fn dimension_name(id: &str) -> String {
+    match id {
+        "minecraft:overworld" => "Overworld".to_owned(),
+        "minecraft:the_nether" => "Nether".to_owned(),
+        "minecraft:the_end" => "End".to_owned(),
+        _ => {
+            let path = id.rsplit(':').next().unwrap_or(id).replace(['_', '/'], " ");
+            let mut c = path.chars();
+            c.next()
+                .map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_list(
+    game: &Game<'_>,
+    batch: &mut HudBatch,
+    size: [f32; 2],
+    mouse: [f32; 2],
+    all: &[Waypoint],
+    order: &[usize],
+    scroll: usize,
+    dimension: &str,
+    player: Option<[f64; 3]>,
+) {
+    let l = wui::list_layout(size, order, scroll);
+    panel(game, batch, l.panel);
+    game.native_text(batch, "Waypoints", l.title, 0xFFFFFF, true);
+    if !order.is_empty() {
+        let range = format!(
+            "{}-{} of {}",
+            l.scroll + 1,
+            l.scroll + l.rows.len(),
+            order.len()
         );
-        let w = game.native_text_width(&text);
-        let ty = if corner.top() { map_y + size + 2.0 } else { y };
-        game.native_text(batch, &text, [x + (size - w) / 2.0, ty], 0xFFFFFF, true);
+        let tw = game.native_text_width(&range);
+        game.native_text(
+            batch,
+            &range,
+            [l.panel[0] + l.panel[2] - 8.0 - tw, l.title[1]],
+            0x9098A0,
+            false,
+        );
+    } else {
+        let empty = "None yet: B adds one where you stand.";
+        game.native_text(
+            batch,
+            empty,
+            [l.panel[0] + 8.0, l.panel[1] + 25.0],
+            0xA0A8B0,
+            false,
+        );
+    }
+    for (i, row, toggle) in &l.rows {
+        let w = &all[*i];
+        if wui::inside(*row, mouse) {
+            game.native_fill(batch, *row, 0x30FF_FFFF);
+        }
+        let alpha: u32 = if w.visible { 0xFF } else { 0x60 };
+        game.native_fill(
+            batch,
+            [row[0] + 2.0, row[1] + 2.0, 9.0, 9.0],
+            (alpha << 24) | (w.color & 0xFF_FFFF),
+        );
+        let rgb = if w.visible { 0xFFFFFF } else { 0x80868C };
+        game.native_text(batch, &w.label(), [row[0] + 15.0, row[1] + 3.0], rgb, true);
+        let info = if w.dimension == dimension {
+            player.map_or(String::new(), |p| format!("{:.0} m", w.distance_to(p)))
+        } else {
+            dimension_name(&w.dimension)
+        };
+        let iw = game.native_text_width(&info);
+        game.native_text(
+            batch,
+            &info,
+            [row[0] + row[2] - 3.0 - iw, row[1] + 3.0],
+            0x9098A0,
+            false,
+        );
+        let name = fit(game, &w.name, row[2] - 48.0 - iw - 8.0, true);
+        game.native_text(batch, &name, [row[0] + 44.0, row[1] + 3.0], rgb, false);
+        button(
+            game,
+            batch,
+            *toggle,
+            if w.visible { "Hide" } else { "Show" },
+            mouse,
+        );
+    }
+    button(game, batch, l.add, "Add where I stand", mouse);
+    button(game, batch, l.done, "Done", mouse);
+}
+
+fn draw_editor(
+    game: &Game<'_>,
+    batch: &mut HudBatch,
+    size: [f32; 2],
+    mouse: [f32; 2],
+    f: &Form,
+    blink: bool,
+) {
+    let e = wui::editor_layout(size);
+    panel(game, batch, e.panel);
+    game.native_text(batch, "Edit waypoint", e.title, 0xFFFFFF, true);
+    for i in 0..wui::FIELDS.len() {
+        let r = e.fields[i];
+        game.native_text(batch, wui::FIELDS[i], e.labels[i], 0xA0A8B0, false);
+        let edge = if f.focus == i {
+            0xFFE0_E4E8
+        } else {
+            0xFF5A_606A
+        };
+        game.native_fill(
+            batch,
+            [r[0] - 1.0, r[1] - 1.0, r[2] + 2.0, r[3] + 2.0],
+            edge,
+        );
+        game.native_fill(batch, r, 0xFF0A_0C10);
+        let mut text = fit(game, &f.fields[i], r[2] - 10.0, false);
+        if f.focus == i && blink {
+            text.push('_');
+        }
+        game.native_text(batch, &text, [r[0] + 3.0, r[1] + 3.0], 0xFFFFFF, false);
+    }
+    for (i, r) in e.swatches.iter().enumerate() {
+        let c = wui::swatch(i);
+        if c & 0xFF_FFFF == f.color & 0xFF_FFFF {
+            game.native_fill(
+                batch,
+                [r[0] - 2.0, r[1] - 2.0, r[2] + 4.0, r[3] + 4.0],
+                0xFFFF_FFFF,
+            );
+            game.native_fill(
+                batch,
+                [r[0] - 1.0, r[1] - 1.0, r[2] + 2.0, r[3] + 2.0],
+                0xFF00_0000,
+            );
+        }
+        game.native_fill(batch, *r, c);
+    }
+    for (b, r) in e.buttons {
+        button(game, batch, r, b.label(f.visible), mouse);
+    }
+    if let Some(error) = f.error {
+        game.native_text(batch, error, e.error, 0xFF5555, false);
     }
 }
 
@@ -1366,9 +2329,10 @@ pub(super) fn screen_draw(game: &Game<'_>, batch: &mut HudBatch, screen: &Native
     }
     let (w, h) = (batch.width, batch.height);
     game.native_fill(batch, [0.0, 0.0, w, h], 0xFF0E_1014);
+    let player = game.native_player();
     let state = with_state_if(|s| {
         let shown = s.shown.filter(|sh| sh.fullscreen);
-        let session = s.session.as_ref();
+        let session = s.map_session();
         // The block under the pointer, as the map shows it.
         let under = shown.zip(session).and_then(|(sh, se)| {
             let img = [sh.view.width as f32, sh.view.height as f32];
@@ -1378,19 +2342,49 @@ pub(super) fn screen_draw(game: &Game<'_>, batch: &mut HudBatch, screen: &Native
             );
             se.block_at(u, v, sh.view.layer)
         });
+        let all = s
+            .waypoints
+            .as_ref()
+            .map_or_else(Vec::new, |ws| ws.all().to_vec());
+        let order = player.as_ref().map_or_else(
+            || (0..all.len()).collect(),
+            |p| wui::list_order(&all, &s.dimension, [p.x, p.y, p.z]),
+        );
         (
             shown,
             session.map(|se| *se.projection()),
             s.map,
-            s.pins(),
+            s.map_pins(),
             under,
             s.toast
                 .clone()
                 .filter(|(_, at)| at.elapsed() < TOAST)
                 .map(|(t, _)| t),
+            s.panel.clone(),
+            all,
+            order,
+            s.dimension.clone(),
+            s.started.elapsed().as_millis() / 500 % 2 == 0,
+            s.settings,
+            s.viewing.as_ref().map(|v| v.dimension.clone()),
         )
     });
-    let Some((shown, projection, map, pins, under, toast)) = state else {
+    let Some((
+        shown,
+        projection,
+        map,
+        pins,
+        under,
+        toast,
+        panel_on,
+        all,
+        order,
+        dimension,
+        blink,
+        settings,
+        viewing,
+    )) = state
+    else {
         return;
     };
     let Some(shown) = shown else {
@@ -1415,13 +2409,53 @@ pub(super) fn screen_draw(game: &Game<'_>, batch: &mut HudBatch, screen: &Native
         let (ix, iy) = shown.view.image_xy(u, v);
         [ix as f32 * w / img[0], iy as f32 * h / img[1]]
     };
-    let player = game.native_player();
+    let on_map = matches!(panel_on, Panel::None);
+    let scale = w / img[0];
+    if let (Some(proj), Some(p)) = (projection, player.as_ref()) {
+        if settings.grid && map.zoom >= 0.5 {
+            let y = if viewing.is_some() { 64.0 } else { p.y.floor() };
+            let (columns, rows) = view::chunk_grid(&shown.view, &proj, y);
+            for cx in columns {
+                game.native_fill(batch, [cx as f32 * scale, 0.0, 1.0, h], 0x38FF_FFFF);
+            }
+            for ry in rows {
+                game.native_fill(batch, [0.0, ry as f32 * scale, w, 1.0], 0x38FF_FFFF);
+            }
+        }
+        if settings.radar && viewing.is_none() {
+            let entities = radar_entities(game, settings.radar_items, [p.x, p.y, p.z]);
+            let blips = radar::place(
+                &shown.view,
+                &proj,
+                &entities,
+                p.y,
+                RADAR_RANGE,
+                8.0 / f64::from(scale),
+            );
+            let z = map.zoom as f32;
+            let size_of = |k: radar::Kind| match k {
+                radar::Kind::Item => z.clamp(2.0, 4.0),
+                radar::Kind::Player => (z * 3.0).clamp(6.0, 12.0),
+                _ => (z * 2.2).clamp(3.0, 8.0),
+            };
+            draw_blips(
+                game,
+                batch,
+                &blips,
+                &entities,
+                [0.0, 0.0],
+                scale,
+                size_of,
+                true,
+            );
+        }
+    }
     // Waypoints, and the name of the one under the pointer.
     if let Some(proj) = projection {
         let placed = screen_pins(&shown, &proj, pins);
         let hovered = placed
             .iter()
-            .rposition(|(_, wp, at)| pin_hit(game, wp, *at, screen.mouse));
+            .rposition(|(_, wp, at)| on_map && pin_hit(game, wp, *at, screen.mouse));
         for (i, (_, wp, at)) in placed.iter().enumerate() {
             if Some(i) != hovered {
                 draw_pin(game, batch, wp, *at, false, false);
@@ -1439,12 +2473,14 @@ pub(super) fn screen_draw(game: &Game<'_>, batch: &mut HudBatch, screen: &Native
             game.native_text(batch, &name, [tx, ty], 0xFFFFFF, false);
         }
     }
-    if let (Some(p), Some(proj)) = (player.as_ref(), projection) {
+    if let (Some(p), Some(proj), None) = (player.as_ref(), projection, &viewing) {
         let at = to_gui(proj.u(p.x, p.z), proj.v(p.x, p.y, p.z));
         arrow(game, batch, at, p.yaw, proj.facing, 10.0);
     }
     // What's under the pointer: the block the map shows there, else the ground at the player's height.
-    let mut lines = vec![if shown.view.layer == TileKey::SURFACE {
+    let mut lines = vec![if let Some(d) = &viewing {
+        format!("{} (saved map)", dimension_name(d))
+    } else if shown.view.layer == TileKey::SURFACE {
         "Surface".to_owned()
     } else {
         format!("Caves at y {}", shown.view.layer)
@@ -1463,24 +2499,69 @@ pub(super) fn screen_draw(game: &Game<'_>, batch: &mut HudBatch, screen: &Native
     for (i, line) in lines.iter().enumerate() {
         game.native_text(batch, line, [6.0, 6.0 + 10.0 * i as f32], 0xFFFFFF, true);
     }
+    let size = [w, h];
+    let list_key = game.native_mod_key(ID, "waypoints", "key.keyboard.u");
+    let list_label = format!("Waypoints ({})", key_letter(&list_key));
+    button(game, batch, list_button(size), &list_label, screen.mouse);
+    let shown_dimension = viewing.as_deref().unwrap_or(&dimension);
+    let map_label = format!("Map: {}", dimension_name(shown_dimension));
+    button(
+        game,
+        batch,
+        dimension_button(size),
+        &map_label,
+        screen.mouse,
+    );
+    if on_map {
+        let help = [
+            "Drag: move · Scroll: zoom · Space: back to you · C: caves · PgUp/PgDn: cave height",
+            "Click a pin: edit · Right-click: add or remove · Middle-click: temporary pin",
+        ];
+        for (i, line) in help.iter().enumerate() {
+            let line = fit(game, line, w - 12.0, true);
+            let y = h - 12.0 - 10.0 * (help.len() - 1 - i) as f32;
+            game.native_text(
+                batch,
+                &line,
+                [(w - game.native_text_width(&line)) / 2.0, y],
+                0xC8C8C8,
+                true,
+            );
+        }
+    } else {
+        game.native_fill(batch, [0.0, 0.0, w, h], 0x7000_0000);
+    }
+    let here = player.as_ref().map(|p| [p.x, p.y, p.z]);
+    match &panel_on {
+        Panel::None => {}
+        Panel::List { scroll } => draw_list(
+            game,
+            batch,
+            size,
+            screen.mouse,
+            &all,
+            &order,
+            *scroll,
+            &dimension,
+            here,
+        ),
+        Panel::Edit(form, _) => draw_editor(game, batch, size, screen.mouse, form, blink),
+    }
     if let Some(toast) = toast {
         let tw = game.native_text_width(&toast);
-        let at = [(w - tw) / 2.0, 24.0];
+        let at = [(w - tw) / 2.0, 26.0];
         game.native_fill(
             batch,
             [at[0] - 4.0, at[1] - 3.0, tw + 8.0, 14.0],
-            0xA000_0000,
+            0xC000_0000,
         );
         game.native_text(batch, &toast, at, 0xFFFFFF, false);
     }
-    let help = "Drag to move · scroll to zoom · right-click to add or remove a waypoint · C caves · PgUp/PgDn slice · Space back to you";
-    game.native_text(
-        batch,
-        help,
-        [(w - game.native_text_width(help)) / 2.0, h - 12.0],
-        0xC8C8C8,
-        true,
-    );
+}
+
+/// A key's letter, `U` for `key.keyboard.u`.
+fn key_letter(key: &str) -> String {
+    key.rsplit('.').next().unwrap_or(key).to_uppercase()
 }
 
 /// The fullscreen map's pins in view: each waypoint's index, the waypoint, and its point in GUI
@@ -1512,8 +2593,25 @@ fn pin_hit(game: &Game<'_>, w: &Waypoint, at: [f32; 2], mouse: [f32; 2]) -> bool
     (x - 1.0..=x + bw + 1.0).contains(&mouse[0]) && (y - 1.0..=at[1] + 1.0).contains(&mouse[1])
 }
 
+/// The pin under the pointer on the fullscreen map, the topmost: its waypoint's index.
+fn pin_under(game: &Game<'_>, s: &State, mouse: [f32; 2]) -> Option<usize> {
+    let shown = s.shown.filter(|sh| sh.fullscreen)?;
+    let projection = *s.map_session()?.projection();
+    screen_pins(&shown, &projection, s.map_pins())
+        .iter()
+        .rev()
+        .find(|(_, w, at)| pin_hit(game, w, *at, mouse))
+        .map(|(i, _, _)| *i)
+}
+
 fn own_screen(game: &Game<'_>, screen: &NativeScreenView<'_>) -> bool {
     screen.id == "mod" && game.native_mod_screen() == Some(ID)
+}
+
+/// The editor for waypoint `index`.
+fn editor(s: &State, index: usize) -> Option<Panel> {
+    let w = s.waypoints.as_ref()?.all().get(index)?;
+    Some(Panel::Edit(Form::of(index, w), w.created))
 }
 
 pub(super) fn screen_press(
@@ -1525,22 +2623,179 @@ pub(super) fn screen_press(
     if !own_screen(game, screen) {
         return;
     }
-    match button {
-        0 => {
-            with_state_if(|s| s.map.dragging = true);
-            *canceled = true;
+    let Some((_, size, _)) = gui(game) else {
+        return;
+    };
+    let mouse = screen.mouse;
+    let player = game.native_player().map(|p| [p.x, p.y, p.z]);
+    *canceled = true;
+    with_state_if(|s| {
+        let mut panel = std::mem::take(&mut s.panel);
+        match &mut panel {
+            Panel::Edit(form, created) => {
+                if button == 0 {
+                    match wui::editor_layout(size).hit(mouse) {
+                        Some(EditorHit::Field(i)) => form.focus = i,
+                        Some(EditorHit::Swatch(i)) => form.color = wui::swatch(i),
+                        Some(EditorHit::Button(b)) => {
+                            if let Some(next) = editor_button(s, form, *created, b) {
+                                panel = next;
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+            Panel::List { scroll } => {
+                if button == 0 {
+                    let order = list_order(s, player);
+                    match wui::list_layout(size, &order, *scroll).hit(mouse) {
+                        Some(ListHit::Open(i)) => {
+                            if let Some(p) = editor(s, i) {
+                                panel = p;
+                            }
+                        }
+                        Some(ListHit::Toggle(i)) => {
+                            if let Some(ws) = s.waypoints.as_mut()
+                                && let Err(e) = ws.edit(i, |w| w.visible = !w.visible)
+                            {
+                                s.toast = Some((format!("Couldn't save: {e}"), Instant::now()));
+                            }
+                        }
+                        Some(ListHit::Add) => {
+                            if let Some(p) = player {
+                                let at = p.map(|c| c.floor() as i32);
+                                if let Some(w) =
+                                    s.waypoints.as_ref().map(|ws| ws.next_at(at, &s.dimension))
+                                {
+                                    let line = s.add_waypoint(w);
+                                    s.toast = Some((line, Instant::now()));
+                                }
+                            }
+                        }
+                        Some(ListHit::Done) => panel = Panel::None,
+                        None => {}
+                    }
+                }
+            }
+            Panel::None => match button {
+                0 if wui::inside(list_button(size), mouse) => {
+                    panel = Panel::List { scroll: 0 };
+                }
+                0 if wui::inside(dimension_button(size), mouse) => switch_dimension(s),
+                0 => {
+                    s.map.dragging = true;
+                    s.press = Some((mouse, false));
+                }
+                1 => {
+                    if let Some(line) = right_click(game, s, mouse, player.map(|p| p[1])) {
+                        s.toast = Some((line, Instant::now()));
+                    }
+                }
+                2 => {
+                    if let Some(at) = map_block(s, mouse, player.map(|p| p[1])) {
+                        let mut w = Waypoint::new("Temporary", at, s.map_dimension(), 0xFFFF_FFFF);
+                        w.kind = waypoint::Kind::Temporary;
+                        w.initials = "T".to_owned();
+                        let line = s.add_waypoint(w);
+                        s.toast = Some((format!("{line} (gone when you leave)"), Instant::now()));
+                    }
+                }
+                _ => {}
+            },
         }
-        1 => {
-            let player_y = game.native_player().map(|p| p.y);
-            with_state_if(|s| {
-                let line = right_click(game, s, screen.mouse, player_y)?;
-                s.toast = Some((line, Instant::now()));
-                Some(())
-            });
-            *canceled = true;
-        }
-        _ => {}
+        s.panel = panel;
+    });
+}
+
+/// The list's order for the player at `player`.
+fn list_order(s: &State, player: Option<[f64; 3]>) -> Vec<usize> {
+    let all = s.waypoints.as_ref().map_or(&[][..], |ws| ws.all());
+    match player {
+        Some(p) => wui::list_order(all, &s.dimension, p),
+        None => (0..all.len()).collect(),
     }
+}
+
+/// An editor button pressed: the panel to show next, if it changes.
+fn editor_button(s: &mut State, form: &mut Form, created: u64, b: Button) -> Option<Panel> {
+    // The waypoint as edited, if it is still there.
+    let index = form.index;
+    let current = s
+        .waypoints
+        .as_ref()
+        .and_then(|ws| ws.all().get(index))
+        .filter(|w| w.created == created)
+        .cloned();
+    let Some(mut edited) = current else {
+        s.toast = Some(("That waypoint is gone".to_owned(), Instant::now()));
+        return Some(Panel::List { scroll: 0 });
+    };
+    let applied = form.apply(&mut edited);
+    match b {
+        Button::Visible => {
+            form.visible = !form.visible;
+            None
+        }
+        Button::Cancel => Some(Panel::List { scroll: 0 }),
+        Button::Delete => {
+            let line = match s.waypoints.as_mut()?.remove(index) {
+                Ok(Some(w)) => format!("Removed {}", w.name),
+                Ok(None) => return Some(Panel::List { scroll: 0 }),
+                Err(e) => format!("Removed, but the list couldn't be saved: {e}"),
+            };
+            s.toast = Some((line, Instant::now()));
+            Some(Panel::List { scroll: 0 })
+        }
+        _ if applied.is_err() => {
+            form.error = applied.err();
+            None
+        }
+        Button::Save => {
+            if let Err(e) = s.waypoints.as_mut()?.edit(index, |w| *w = edited) {
+                s.toast = Some((format!("Couldn't save: {e}"), Instant::now()));
+            }
+            Some(Panel::List { scroll: 0 })
+        }
+        Button::Share => {
+            match share::format(&edited) {
+                Some(line) => {
+                    s.outbox.push(Outgoing::Chat(line));
+                    s.toast = Some(("Shared in chat".to_owned(), Instant::now()));
+                }
+                None => form.error = Some("Too long to share in chat"),
+            }
+            None
+        }
+        Button::Teleport => {
+            s.outbox.push(Outgoing::Teleport {
+                at: [edited.x, edited.y, edited.z],
+                dimension: edited.dimension,
+            });
+            s.outbox.push(Outgoing::Close);
+            Some(Panel::None)
+        }
+    }
+}
+
+/// The block a waypoint placed at the pointer stands on: on what the map shows there, else at the
+/// player's height.
+fn map_block(s: &State, mouse: [f32; 2], player_y: Option<f64>) -> Option<[i32; 3]> {
+    let shown = s.shown.filter(|sh| sh.fullscreen)?;
+    let session = s.map_session()?;
+    let img = [shown.view.width as f32, shown.view.height as f32];
+    let (u, v) = shown.view.map_uv(
+        f64::from(mouse[0] * img[0] / shown.gui[0]),
+        f64::from(mouse[1] * img[1] / shown.gui[1]),
+    );
+    Some(match session.block_at(u, v, shown.view.layer) {
+        Some([x, y, z]) => [x, y + 1, z],
+        None => {
+            let y = player_y?.floor();
+            let (x, z) = session.projection().world_at(u, v, y);
+            [x.floor() as i32, y as i32, z.floor() as i32]
+        }
+    })
 }
 
 /// A right click on the fullscreen map: on a pin it removes that waypoint; anywhere else it adds
@@ -1551,15 +2806,8 @@ fn right_click(
     mouse: [f32; 2],
     player_y: Option<f64>,
 ) -> Option<String> {
-    let shown = s.shown.filter(|sh| sh.fullscreen)?;
-    let projection = *s.session.as_ref()?.projection();
-    let placed = screen_pins(&shown, &projection, s.pins());
-    if let Some((index, _, _)) = placed
-        .iter()
-        .rev()
-        .find(|(_, w, at)| pin_hit(game, w, *at, mouse))
-    {
-        return Some(match s.waypoints.as_mut()?.remove(*index) {
+    if let Some(index) = pin_under(game, s, mouse) {
+        return Some(match s.waypoints.as_mut()?.remove(index) {
             Ok(Some(w)) => format!("Removed {}", w.name),
             Ok(None) => return None,
             Err(e) => {
@@ -1568,21 +2816,8 @@ fn right_click(
             }
         });
     }
-    let img = [shown.view.width as f32, shown.view.height as f32];
-    let (u, v) = shown.view.map_uv(
-        f64::from(mouse[0] * img[0] / shown.gui[0]),
-        f64::from(mouse[1] * img[1] / shown.gui[1]),
-    );
-    let at = match s.session.as_ref()?.block_at(u, v, shown.view.layer) {
-        Some([x, y, z]) => [x, y + 1, z],
-        None => {
-            // Nothing loaded there: the ground at the player's height.
-            let y = player_y?.floor();
-            let (x, z) = projection.world_at(u, v, y);
-            [x.floor() as i32, y as i32, z.floor() as i32]
-        }
-    };
-    let w = s.waypoints.as_ref()?.next_at(at, &s.dimension);
+    let at = map_block(s, mouse, player_y)?;
+    let w = s.waypoints.as_ref()?.next_at(at, s.map_dimension());
     Some(s.add_waypoint(w))
 }
 
@@ -1596,7 +2831,17 @@ pub(super) fn screen_release(
         return;
     }
     if button == 0 {
-        with_state_if(|s| s.map.dragging = false);
+        with_state_if(|s| {
+            s.map.dragging = false;
+            // A click on a pin, not a drag, opens its editor.
+            if let Some((_, false)) = s.press.take()
+                && matches!(s.panel, Panel::None)
+                && let Some(i) = pin_under(game, s, screen.mouse)
+                && let Some(p) = editor(s, i)
+            {
+                s.panel = p;
+            }
+        });
         *canceled = true;
     }
 }
@@ -1611,7 +2856,11 @@ pub(super) fn screen_drag(
         return;
     }
     with_state_if(|s| {
-        if s.map.dragging {
+        if s.map.dragging && matches!(s.panel, Panel::None) {
+            if let Some((from, moved)) = &mut s.press {
+                let (dx, dy) = (screen.mouse[0] - from[0], screen.mouse[1] - from[1]);
+                *moved |= dx * dx + dy * dy > 9.0;
+            }
             s.map.follow = false;
             s.map.center.0 -= f64::from(delta[0]) / s.map.zoom;
             s.map.center.1 -= f64::from(delta[1]) / s.map.zoom;
@@ -1632,22 +2881,29 @@ pub(super) fn screen_scroll(
     let Some((_, gui_size, _)) = gui(game) else {
         return;
     };
-    with_state_if(|s| {
-        let before = s.map.zoom;
-        let after = (before * 1.25f64.powf(scroll[1])).clamp(MAP_MIN_ZOOM, MAP_MAX_ZOOM);
-        // Keep the point under the pointer where it is.
-        let (mx, my) = (
-            f64::from(screen.mouse[0] - gui_size[0] / 2.0),
-            f64::from(screen.mouse[1] - gui_size[1] / 2.0),
-        );
-        s.map.center.0 += mx / before - mx / after;
-        s.map.center.1 += my / before - my / after;
-        s.map.zoom = after;
-        if mx.abs() > 1.0 || my.abs() > 1.0 {
-            s.map.follow = false;
+    *canceled = true;
+    with_state_if(|s| match &mut s.panel {
+        Panel::List { scroll: row } => {
+            let step = scroll[1].round() as i64;
+            *row = (*row as i64 - step).max(0) as usize;
+        }
+        Panel::Edit(..) => {}
+        Panel::None => {
+            let before = s.map.zoom;
+            let after = (before * 1.25f64.powf(scroll[1])).clamp(MAP_MIN_ZOOM, MAP_MAX_ZOOM);
+            // Keep the point under the pointer where it is.
+            let (mx, my) = (
+                f64::from(screen.mouse[0] - gui_size[0] / 2.0),
+                f64::from(screen.mouse[1] - gui_size[1] / 2.0),
+            );
+            s.map.center.0 += mx / before - mx / after;
+            s.map.center.1 += my / before - my / after;
+            s.map.zoom = after;
+            if mx.abs() > 1.0 || my.abs() > 1.0 {
+                s.map.follow = false;
+            }
         }
     });
-    *canceled = true;
 }
 
 pub(super) fn screen_key(
@@ -1660,31 +2916,167 @@ pub(super) fn screen_key(
         return;
     }
     let player_y = game.native_player().map_or(64.0, |p| p.y);
-    let handled = with_state_if(|s| match key {
-        "key.keyboard.c" => {
-            s.map.caves = !s.map.caves;
-            true
-        }
-        "key.keyboard.space" => {
-            s.map.follow = true;
-            true
-        }
-        "key.keyboard.page.up" | "key.keyboard.page.down" => {
-            let step = if key == "key.keyboard.page.up" { 4 } else { -4 };
-            let layer = s
-                .map
-                .layer
-                .unwrap_or_else(|| session::cave_layer_for(player_y))
-                + step;
-            s.map.layer = Some(layer);
-            s.map.caves = true;
-            true
-        }
-        _ => false,
+    let list_key = game.native_mod_key(ID, "waypoints", "key.keyboard.u");
+    let handled = with_state_if(|s| {
+        let mut panel = std::mem::take(&mut s.panel);
+        let handled = match &mut panel {
+            // The editor takes every key, so typing never reaches the map or closes the screen.
+            Panel::Edit(form, created) => {
+                match key {
+                    "key.keyboard.backspace" => form.backspace(),
+                    "key.keyboard.tab" => form.tab(false),
+                    "key.keyboard.up" => form.tab(true),
+                    "key.keyboard.down" => form.tab(false),
+                    "key.keyboard.enter" | "key.keyboard.keypad.enter" => {
+                        if let Some(next) = editor_button(s, form, *created, Button::Save) {
+                            panel = next;
+                        }
+                    }
+                    "key.keyboard.escape" => panel = Panel::List { scroll: 0 },
+                    _ => {}
+                }
+                true
+            }
+            Panel::List { scroll } => match key {
+                "key.keyboard.escape" => {
+                    panel = Panel::None;
+                    true
+                }
+                "key.keyboard.up" => {
+                    *scroll = scroll.saturating_sub(1);
+                    true
+                }
+                "key.keyboard.down" => {
+                    *scroll += 1;
+                    true
+                }
+                k if k == list_key => {
+                    panel = Panel::None;
+                    true
+                }
+                _ => false,
+            },
+            Panel::None => match key {
+                "key.keyboard.c" => {
+                    s.map.caves = !s.map.caves;
+                    true
+                }
+                "key.keyboard.space" => {
+                    s.map.follow = true;
+                    if s.viewing.take().is_some() {
+                        s.shown = None;
+                    }
+                    true
+                }
+                "key.keyboard.page.up" | "key.keyboard.page.down" => {
+                    let step = if key == "key.keyboard.page.up" { 4 } else { -4 };
+                    let layer = s
+                        .map
+                        .layer
+                        .unwrap_or_else(|| session::cave_layer_for(player_y))
+                        + step;
+                    s.map.layer = Some(layer);
+                    s.map.caves = true;
+                    true
+                }
+                k if k == list_key => {
+                    panel = Panel::List { scroll: 0 };
+                    true
+                }
+                _ => false,
+            },
+        };
+        s.panel = panel;
+        handled
     });
     if handled == Some(true) {
         *canceled = true;
     }
+}
+
+/// A character typed on the fullscreen map: into the editor's field.
+pub(super) fn screen_char(
+    game: &Game<'_>,
+    screen: &NativeScreenView<'_>,
+    c: char,
+    canceled: &mut bool,
+) {
+    if !own_screen(game, screen) {
+        return;
+    }
+    with_state_if(|s| {
+        if let Panel::Edit(form, _) = &mut s.panel {
+            form.type_char(c);
+            *canceled = true;
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Chat: shared waypoints and the commands their links run
+
+pub(super) fn commands(commands: &mut Vec<&'static str>) {
+    commands.push("diorama");
+}
+
+/// `/diorama waypoint add ...` (the [Add] link's) and `/diorama waypoint list`.
+pub(super) fn command(game: &mut Game<'_>, command: &str, ran: &mut bool) {
+    let command = command.trim();
+    if command != "diorama" && !command.starts_with("diorama ") {
+        return;
+    }
+    *ran = true;
+    let player_y = game.native_player().map_or(64, |p| p.y.floor() as i32);
+    let line = if command == "diorama waypoint list" {
+        with_state(game, |s| {
+            s.panel = Panel::List { scroll: 0 };
+            s.open_map = true;
+        });
+        None
+    } else if let Some(shared) = share::parse_add_command(command) {
+        with_state(game, |s| Some(s.add_waypoint(shared.waypoint(player_y))))
+    } else {
+        Some(
+            "Usage: /diorama waypoint list, or /diorama waypoint add <x> <y> <z> <colour 0-15> \"<dimension>\" \"<letters>\" <name>"
+                .to_owned(),
+        )
+    };
+    if let Some(line) = line {
+        game.native_chat(&format!("Diorama: {line}"));
+    }
+    open_map_if_asked(game);
+}
+
+/// A chat line with a shared waypoint in it gets an [Add] link.
+pub(super) fn chat_received(game: &mut Game<'_>, message: &mut Text) {
+    if !game.native_on(ID) {
+        return;
+    }
+    let Some(shared) = share::parse(&message.plain()) else {
+        return;
+    };
+    let y = shared
+        .y
+        .unwrap_or_else(|| game.native_player().map_or(64, |p| p.y.floor() as i32));
+    let hover = format!(
+        "Add {} at {} {} {} ({})",
+        shared.name,
+        shared.x,
+        y,
+        shared.z,
+        dimension_name(&shared.dimension)
+    );
+    let style = Style {
+        color: Some(0x55FF55),
+        click: Some(ClickEvent::RunCommand(format!(
+            "/{}",
+            share::add_command(&shared, y)
+        ))),
+        hover: Some(Box::new(Text::literal(hover))),
+        ..Style::default()
+    };
+    message.push(Text::literal(" "));
+    message.push(Text::styled("[Add]", style));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1712,7 +3104,7 @@ mod tests {
     fn settings_round_trip() {
         let mut s = Settings::read(|_| None);
         assert_eq!(s, Settings::default());
-        for i in 0..10 {
+        for i in 0..22 {
             s.click(i);
         }
         let stored = s.stored();
@@ -1723,6 +3115,35 @@ mod tests {
                 .map(|(_, v)| v.clone())
         });
         assert_eq!(back, s);
-        assert_eq!(s.labels().len(), 10);
+        assert_eq!(s.labels().len(), 22);
+        assert_eq!(s.stored().len(), 22);
+        // Every choice of each new setting comes back as it went.
+        for _ in 0..8 {
+            for i in 16..22 {
+                s.click(i);
+            }
+            let stored = s.stored();
+            let back = Settings::read(|k| {
+                stored
+                    .iter()
+                    .find(|(key, _)| *key == k)
+                    .map(|(_, v)| v.clone())
+            });
+            assert_eq!(back, s);
+        }
+        // A saved percentage between steps snaps to the nearest.
+        let s = Settings::read(|k| (k == "opacity").then(|| "55".to_owned()));
+        assert_eq!(s.opacity, 60);
+        assert!((s.opacity() - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn clock_formats() {
+        assert_eq!(clock_text(ClockFormat::Only24h, 0), "06:00");
+        assert_eq!(clock_text(ClockFormat::Day24h, 0), "Day 1, 06:00");
+        assert_eq!(clock_text(ClockFormat::Day24h, 18_000), "Day 2, 00:00");
+        assert_eq!(clock_text(ClockFormat::Only12h, 18_000), "12:00 AM");
+        assert_eq!(clock_text(ClockFormat::Day12h, 6_000), "Day 1, 12:00 PM");
+        assert_eq!(clock_text(ClockFormat::Only12h, 13_500), "07:30 PM");
     }
 }

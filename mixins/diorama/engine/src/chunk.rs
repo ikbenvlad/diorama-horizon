@@ -195,6 +195,10 @@ pub struct ChunkSnapshot {
     section_tops: Vec<u8>,
     /// One above the highest non-air block, or `i32::MIN` when the chunk is empty.
     pub top_y: i32,
+    /// One above the lowest column's highest non-air block: nothing of the chunk under it shows
+    /// from the sky but through water or under overhangs. The chunk's bottom when a column is
+    /// empty.
+    pub floor_y: i32,
 }
 
 impl ChunkSnapshot {
@@ -208,6 +212,43 @@ impl ChunkSnapshot {
         is_air: impl Fn(u32) -> bool,
     ) -> ChunkSnapshot {
         let mut ids = [0u32; SECTION_BLOCKS];
+        // Each column's surface, from the top down, until every column has one.
+        let mut columns = [i32::MIN; 256];
+        let mut open = 256;
+        for (i, s) in sections.iter().enumerate().rev() {
+            if open == 0 {
+                break;
+            }
+            let base = (min_section_y + i as i32) * 16;
+            match &s.blocks {
+                Blocks::Single(id) if is_air(*id) => continue,
+                Blocks::Single(_) => {
+                    for c in columns.iter_mut().filter(|c| **c == i32::MIN) {
+                        *c = base + 16;
+                    }
+                    open = 0;
+                }
+                Blocks::Packed { .. } => {
+                    s.blocks.unpack(&mut ids);
+                    for (col, c) in columns.iter_mut().enumerate() {
+                        if *c != i32::MIN {
+                            continue;
+                        }
+                        if let Some(ly) =
+                            (0..16usize).rev().find(|ly| !is_air(ids[(ly << 8) | col]))
+                        {
+                            *c = base + ly as i32 + 1;
+                            open -= 1;
+                        }
+                    }
+                }
+            }
+        }
+        let floor_y = if open > 0 {
+            min_section_y * 16
+        } else {
+            columns.iter().copied().min().unwrap_or(min_section_y * 16)
+        };
         let section_tops: Vec<u8> = sections
             .iter()
             .map(|s| match &s.blocks {
@@ -250,6 +291,7 @@ impl ChunkSnapshot {
             tints,
             section_tops,
             top_y,
+            floor_y,
         }
     }
 
@@ -337,6 +379,8 @@ mod tests {
         assert_eq!(c.min_y(), -64);
         assert_eq!(c.max_y(), -16);
         assert_eq!(c.top_y, -48 + 10);
+        // Most columns of the second section are air: the floor is the full first section's top.
+        assert_eq!(c.floor_y, -48);
         assert_eq!(c.top_below(1000, |id| id == 0), -38);
         assert_eq!(c.top_below(-39, |id| id == 0), -48 + 6);
         assert_eq!(c.top_below(-48, |id| id == 0), -48);

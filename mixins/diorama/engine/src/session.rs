@@ -10,19 +10,32 @@ use crate::projection::{Facing, Projection, TILE_UNITS};
 use crate::source::{ChunkSource, LiveChunks};
 use crate::store::TileStore;
 use crate::style::MapStyle;
-use crate::tile::TileKey;
-use crate::view::{self, Fog, TileCache, View};
+use crate::tile::{Patches, TileKey};
+use crate::view::{self, Fog, Look, TileCache, View};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Chunk light usually lands a moment after the blocks, so new chunks wait this long.
+/// Chunk light usually lands a moment after the blocks, so tiles lit by the game's light (cave
+/// slices, and the view under a roof) wait this long after a chunk arrives. The open sky's sun
+/// and shade don't read it.
 pub const LOAD_DELAY: Duration = Duration::from_millis(750);
-pub const CHANGE_DELAY: Duration = Duration::from_millis(250);
-/// The longest a tile waits while chunks keep arriving under it.
-const MAX_WAIT: Duration = Duration::from_secs(3);
+/// A tile bakes once nothing under it changed for this long...
+pub const CHANGE_DELAY: Duration = Duration::from_millis(100);
+/// ...or this long after the first change, while chunks keep arriving under it.
+const MAX_WAIT: Duration = Duration::from_millis(500);
+/// Water and overhangs can show blocks this far below a chunk's lowest column top.
+const FLOOR_MARGIN: i32 = 24;
+
+/// Patches of a tile waiting to bake again.
+#[derive(Clone, Copy, Debug)]
+struct Dirty {
+    first: Instant,
+    due: Instant,
+    patches: Patches,
+}
 /// Tiles held for drawing: about 1.3 MiB each with their mips.
 const CACHE_TILES: usize = 96;
 
@@ -66,8 +79,8 @@ pub struct MapSession {
     looks: Option<Arc<BlockLooks>>,
     projection: Projection,
     cache: TileCache,
-    /// Tiles to bake again, and when they were first and are next due.
-    dirty: HashMap<TileKey, (Instant, Instant)>,
+    /// Tiles to bake again: which patches, and when.
+    dirty: HashMap<TileKey, Dirty>,
     /// Cave slices drawn besides the surface.
     cave_layer: Option<i32>,
     loader: Loader,
@@ -186,7 +199,7 @@ impl MapSession {
         }
         let now = Instant::now();
         for (cx, cz) in self.live.keys() {
-            self.dirty_chunk(cx, cz, now, Duration::ZERO);
+            self.dirty_chunk(cx, cz, now, Some(Duration::ZERO));
         }
     }
 
@@ -207,7 +220,7 @@ impl MapSession {
     pub fn chunk_loaded(&mut self, chunk: Arc<ChunkSnapshot>, now: Instant) {
         let (cx, cz) = (chunk.x, chunk.z);
         self.live.put(chunk);
-        self.dirty_chunk(cx, cz, now, LOAD_DELAY);
+        self.dirty_chunk(cx, cz, now, None);
     }
 
     /// The game unloaded a chunk. Its tiles stay as saved.
@@ -225,13 +238,10 @@ impl MapSession {
     ) {
         self.live.put(chunk);
         for layer in self.layers() {
-            if let Some(cut) = (layer != TileKey::SURFACE).then_some(layer)
-                && (box_min[1] > cut || box_max[1] < cut - baker::CAVE_DEPTH)
+            for (key, patches) in
+                baker::touched(&self.projection, layer, self.config.roof, box_min, box_max)
             {
-                continue;
-            }
-            for key in baker::tiles_touched(&self.projection, layer, box_min, box_max) {
-                self.mark(key, now, CHANGE_DELAY);
+                self.mark(key, patches, now, CHANGE_DELAY);
             }
         }
     }
@@ -242,51 +252,67 @@ impl MapSession {
         l
     }
 
-    fn dirty_chunk(&mut self, cx: i32, cz: i32, now: Instant, delay: Duration) {
+    /// A chunk arrived, or everything is to be baked again (`whole`, after `delay`): the tiles
+    /// it shows in. While a chunk was missing, rays from any height above its ground could stop
+    /// at it, so that whole range bakes again: in the open, from a little under its lowest
+    /// ground up; under a roof, from the bottom of the world.
+    fn dirty_chunk(&mut self, cx: i32, cz: i32, now: Instant, whole: Option<Duration>) {
         let Some(chunk) = self.live.chunk(cx, cz) else {
             return;
         };
-        let top = if chunk.top_y == i32::MIN {
-            self.config.min_y
-        } else {
-            chunk.top_y
-        };
+        let min_y = self.config.min_y;
+        let top = chunk.top_y.max(self.live.top_y()).max(min_y);
         for layer in self.layers() {
-            let (y0, y1) = if layer == TileKey::SURFACE {
-                (self.config.min_y, top)
+            let (y0, y1) = if layer != TileKey::SURFACE {
+                ((layer - baker::CAVE_DEPTH).max(min_y), layer.min(top))
+            } else if self.config.roof.is_some() {
+                (min_y, top)
             } else {
-                (
-                    (layer - baker::CAVE_DEPTH).max(self.config.min_y),
-                    layer.min(top),
-                )
+                ((chunk.floor_y - FLOOR_MARGIN).clamp(min_y, top), top)
             };
             if y1 < y0 {
                 continue;
             }
-            for key in baker::tiles_touched(
+            // Only the open sky bakes without the game's light.
+            let open = layer == TileKey::SURFACE && self.config.roof.is_none();
+            let delay = whole.unwrap_or(if open { CHANGE_DELAY } else { LOAD_DELAY });
+            for (key, patches) in baker::touched(
                 &self.projection,
                 layer,
+                self.config.roof,
                 [cx * 16, y0, cz * 16],
                 [cx * 16 + 15, y1, cz * 16 + 15],
             ) {
-                self.mark(key, now, delay);
+                let patches = if whole.is_some() {
+                    Patches::ALL
+                } else {
+                    patches
+                };
+                self.mark(key, patches, now, delay);
             }
         }
     }
 
-    /// Something under a tile changed: bake it again after `delay`.
-    fn mark(&mut self, key: TileKey, now: Instant, delay: Duration) {
+    /// Something under a tile changed: bake those patches again once it is quiet for `delay`.
+    fn mark(&mut self, key: TileKey, patches: Patches, now: Instant, delay: Duration) {
         self.absent.remove(&key);
         self.tried.remove(&key);
-        self.schedule(key, now, delay);
+        self.schedule(key, patches, now, delay);
     }
 
-    fn schedule(&mut self, key: TileKey, now: Instant, delay: Duration) {
+    fn schedule(&mut self, key: TileKey, patches: Patches, now: Instant, delay: Duration) {
         let due = now + delay;
         self.dirty
             .entry(key)
-            .and_modify(|(first, d)| *d = (*d).max(due).min(*first + MAX_WAIT))
-            .or_insert((now, due));
+            .and_modify(|d| {
+                d.due = d.due.max(due).min(d.first + MAX_WAIT);
+                d.patches = d.patches.union(patches);
+            })
+            .or_insert(Dirty {
+                first: now,
+                due,
+                patches,
+            });
     }
 
     /// Shows the cave slice at `layer` besides the surface, or none. A new slice is baked from
@@ -305,7 +331,7 @@ impl MapSession {
         if layer.is_some() {
             let now = Instant::now();
             for (cx, cz) in self.live.keys() {
-                self.dirty_chunk(cx, cz, now, Duration::ZERO);
+                self.dirty_chunk(cx, cz, now, Some(Duration::ZERO));
             }
         }
     }
@@ -336,14 +362,15 @@ impl MapSession {
             let due: Vec<TileKey> = self
                 .dirty
                 .iter()
-                .filter(|(_, (_, d))| *d <= now)
+                .filter(|(_, d)| d.due <= now)
                 .map(|(k, _)| *k)
                 .collect();
             if !due.is_empty() {
-                for k in &due {
-                    self.dirty.remove(k);
-                }
-                bakery.request(due.into_iter().map(|k| (k, rank(&k))));
+                let due: Vec<(TileKey, i64, Patches)> = due
+                    .into_iter()
+                    .filter_map(|k| self.dirty.remove(&k).map(|d| (k, rank(&k), d.patches)))
+                    .collect();
+                bakery.request(due);
             }
             bakery.reprioritize(rank);
             // Tiles from before a change of looks or style are still the best there is until
@@ -385,9 +412,16 @@ impl MapSession {
         }
     }
 
-    /// Draws a view into `out` (ABGR pixels, `view.width * view.height`), asking for the tiles it
-    /// lacks: from the store, or baked when there are chunks to bake them from.
-    pub fn compose(&mut self, view: &View, fog: &Fog, out: &mut [u32]) {
+    /// The look of `layer` in this dimension: the backdrop of caves, of a dimension drawn from
+    /// under its roof, or of the open sky; by day and opaque.
+    pub fn look(&self, layer: i32) -> Look {
+        Look::new(layer != TileKey::SURFACE, self.config.roof.is_some())
+    }
+
+    /// Draws a view into `out` (ABGR pixels, `view.width * view.height`) as `look` has it, with
+    /// `fog` over unknown ground, asking for the tiles it lacks: from the store, or baked when
+    /// there are chunks to bake them from.
+    pub fn compose(&mut self, view: &View, look: &Look, fog: Option<&Fog>, out: &mut [u32]) {
         if view.lod > 0 {
             for key in view.tiles() {
                 if !self.cache.contains(&key) {
@@ -395,7 +429,7 @@ impl MapSession {
                 }
             }
         }
-        let missing = view::compose(view, &mut self.cache, fog, out);
+        let missing = view::compose(view, &mut self.cache, look, fog, out);
         for key in missing {
             if self.loading.contains(&key) {
                 continue;
@@ -408,7 +442,7 @@ impl MapSession {
                     && self.has_chunks_under(key)
                 {
                     self.tried.insert(key);
-                    self.schedule(key, Instant::now(), Duration::ZERO);
+                    self.schedule(key, Patches::ALL, Instant::now(), Duration::ZERO);
                 }
                 continue;
             }
@@ -435,10 +469,7 @@ impl MapSession {
         if !any {
             return false;
         }
-        let pixels: Vec<Option<Vec<u32>>> = children
-            .iter()
-            .map(|c| self.cache.pixels(c).map(<[u32]>::to_vec))
-            .collect();
+        let pixels: Vec<Option<Vec<u32>>> = children.iter().map(|c| self.cache.pixels(c)).collect();
         let refs: [Option<&[u32]>; 4] = std::array::from_fn(|i| pixels[i].as_deref());
         let image = crate::tile::overview(key, refs);
         self.cache.insert(&image);
@@ -582,7 +613,12 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             s.tick(Instant::now() + LOAD_DELAY, player);
-            s.compose(&view, &Fog::default(), &mut out);
+            s.compose(
+                &view,
+                &Look::new(false, false),
+                Some(&Fog::default()),
+                &mut out,
+            );
             let (d, w, b) = s.busy();
             if d + w + b == 0 && s.cache_version() > 0 {
                 break;
@@ -590,7 +626,12 @@ mod tests {
             assert!(Instant::now() < deadline, "bakes finish");
             std::thread::sleep(Duration::from_millis(20));
         }
-        s.compose(&view, &Fog::default(), &mut out);
+        s.compose(
+            &view,
+            &Look::new(false, false),
+            Some(&Fog::default()),
+            &mut out,
+        );
         let centre = out[48 * 96 + 48];
         assert_eq!(centre >> 24, 255);
         let (r, g, b) = (centre & 0xFF, (centre >> 8) & 0xFF, (centre >> 16) & 0xFF);
@@ -635,8 +676,93 @@ mod tests {
         };
         assert!(view.lod >= 1);
         let mut out = vec![0u32; 256];
-        s.compose(&view, &Fog::default(), &mut out);
+        s.compose(
+            &view,
+            &Look::new(false, false),
+            Some(&Fog::default()),
+            &mut out,
+        );
         assert_eq!(out[8 * 16 + 8], 0xFF00_FF00, "drawn from the level-0 tile");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ticks until nothing waits or bakes.
+    fn settle(s: &mut MapSession, view: &View, out: &mut [u32], player: [f64; 3]) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            s.tick(Instant::now() + MAX_WAIT, player);
+            s.compose(view, &Look::new(false, false), Some(&Fog::default()), out);
+            let (d, w, b) = s.busy();
+            if d + w + b == 0 && s.loading.is_empty() {
+                s.tick(Instant::now(), player);
+                s.compose(view, &Look::new(false, false), Some(&Fog::default()), out);
+                return;
+            }
+            assert!(Instant::now() < deadline, "bakes finish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_late_chunk_lifts_the_fog_over_it() {
+        let dir = std::env::temp_dir().join(format!("diorama-late-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let world = crate::baker::tests::flat_world(2, false);
+        let mut s = MapSession::new(SessionConfig {
+            folder: dir.clone(),
+            min_y: -64,
+            max_y: 320,
+            roof: None,
+            style: MapStyle::DEFAULT,
+            facing: Facing::North,
+            fast: true,
+            threads: 2,
+        });
+        s.set_looks(Arc::new(test_looks()));
+        let late = (1, 0);
+        let now = Instant::now();
+        for (cx, cz) in world.keys().into_iter().filter(|k| *k != late) {
+            s.chunk_loaded(world.chunk(cx, cz).unwrap(), now);
+        }
+        let player = [8.0, 64.0, 8.0];
+        let (u, v) = s.uv(player);
+        let view = View {
+            center_u: u,
+            center_v: v,
+            zoom: 1.0,
+            layer: TileKey::SURFACE,
+            lod: 0,
+            width: 128,
+            height: 128,
+            round: false,
+        };
+        let mut out = vec![0u32; 128 * 128];
+        settle(&mut s, &view, &mut out, player);
+        // The grass in the middle of the late chunk, where the view shows it.
+        let (gu, gv) = s.uv([24.5, 64.0, 8.5]);
+        let (x, y) = view.image_xy(gu, gv);
+        let at = y as usize * 128 + x as usize;
+        let units = f64::from(TILE_UNITS);
+        let tile = TileKey::new(
+            TileKey::SURFACE,
+            (gu / units).floor() as i32,
+            (gv / units).floor() as i32,
+        );
+        assert!(s.cache.contains(&tile), "its tile is drawn");
+        let fogged = out[at];
+        s.chunk_loaded(world.chunk(late.0, late.1).unwrap(), Instant::now());
+        let d = s.dirty.get(&tile).expect("its tile waits to bake");
+        assert!(!d.patches.is_all(), "only part of it");
+        assert!(
+            d.due <= Instant::now() + CHANGE_DELAY,
+            "without waiting for light"
+        );
+        settle(&mut s, &view, &mut out, player);
+        let lifted = out[at];
+        assert_ne!(fogged, lifted);
+        let (r, g, b) = (lifted & 0xFF, (lifted >> 8) & 0xFF, (lifted >> 16) & 0xFF);
+        assert!(g > r && g > b, "grass where the fog was: {r} {g} {b}");
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }

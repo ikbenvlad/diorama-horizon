@@ -168,6 +168,52 @@ bindings = [
 ]
 
 [[injection]]
+id = "screen-char"
+hook = "screen_char_typed_pre"
+hook_version = 1
+kind = "HEAD"
+helper = "screen_char.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "screen", ty = "&horizon_client::mod_api::NativeScreenView<'_>", value = "screen" },
+  { name = "c", ty = "char", value = "c" },
+  { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]
+
+[[injection]]
+id = "commands"
+hook = "commands"
+hook_version = 1
+kind = "HEAD"
+helper = "commands.rs"
+bindings = [
+  { name = "commands", ty = "&mut Vec<&'static str>", value = "&mut *commands" },
+]
+
+[[injection]]
+id = "command"
+hook = "command"
+hook_version = 1
+kind = "HEAD"
+helper = "command.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "command", ty = "&str", value = "command" },
+  { name = "ran", ty = "&mut bool", value = "&mut *ran" },
+]
+
+[[injection]]
+id = "chat-received"
+hook = "client_chat_received"
+hook_version = 1
+kind = "HEAD"
+helper = "chat_received.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "message", ty = "&mut horizon_client::text::Text", value = "&mut *message" },
+]
+
+[[injection]]
 id = "level-unload"
 hook = "client_level_unload"
 hook_version = 1

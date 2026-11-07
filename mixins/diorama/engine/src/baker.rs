@@ -14,7 +14,7 @@ use crate::projection::{PIXELS_PER_UNIT, Projection, TILE_PIXELS, TILE_UNITS};
 use crate::reader::{UNKNOWN, VoxelReader};
 use crate::source::ChunkSource;
 use crate::style::MapStyle;
-use crate::tile::{TileImage, TileKey};
+use crate::tile::{PATCH, Patches, TileImage, TileKey};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -311,6 +311,32 @@ impl<'a> Baker<'a> {
         let size = TILE_PIXELS as usize;
         let pixels = baker.bake_pixels(0, 0, size, size);
         TileImage { key, pixels }
+    }
+
+    /// Bakes `patches` of a tile over `pixels`, its last image: each fresh pixel replaces the one
+    /// there unless it is less known, so ground whose chunks went away stays as it was.
+    pub fn bake_into(
+        key: TileKey,
+        source: &dyn ChunkSource,
+        looks: &BlockLooks,
+        settings: &BakeSettings,
+        patches: &Patches,
+        pixels: &mut [u32],
+    ) {
+        let mut baker = Baker::new(key, source, looks, settings);
+        let size = TILE_PIXELS as usize;
+        for (row, x0, x1) in patches.runs() {
+            let (px0, py0, w) = (x0 * PATCH, row * PATCH, (x1 - x0) * PATCH);
+            let fresh = baker.bake_pixels(px0, py0, w, PATCH);
+            for (y, line) in fresh.chunks_exact(w).enumerate() {
+                let at = (py0 + y) * size + px0;
+                for (p, &f) in pixels[at..at + w].iter_mut().zip(line) {
+                    if f >> 24 >= *p >> 24 {
+                        *p = f;
+                    }
+                }
+            }
+        }
     }
 
     /// How many chunks this bake asked for and the source didn't have.
@@ -1190,44 +1216,68 @@ fn local_top(
     }
 }
 
-/// The tiles (level 0, of `layer`) whose pixels may change when blocks in world box
-/// `min..=max` change: where those blocks show, and where their shadows,
-/// shade and sky occlusion fall.
-pub fn tiles_touched(p: &Projection, layer: i32, min: [i32; 3], max: [i32; 3]) -> Vec<TileKey> {
+/// How far a block's light reaches, which matters in cave slices and under a roof.
+pub const LIGHT_REACH: i32 = 15;
+
+/// The tiles of `layer` (level 0), and the patches of each, whose pixels may change when blocks
+/// in world box `min..=max` change: where those blocks show, where their shadows fall (east,
+/// north and down, away from the sun), the sky they hide, their corner shade and, in a cave slice
+/// or under a roof (`roof`, the y above the space under it), their light.
+pub fn touched(
+    p: &Projection,
+    layer: i32,
+    roof: Option<i32>,
+    min: [i32; 3],
+    max: [i32; 3],
+) -> Vec<(TileKey, Patches)> {
     let ([x0, y0, z0], [x1, y1, z1]) = (min, max);
-    let (rx, rz, ry) = shadow_reach();
-    let pad = SKY_REACH + 1;
-    // The box's corners in turned space.
     let f = p.facing;
-    let xs = [
-        f.block_x(x0, z0),
-        f.block_x(x1, z1),
-        f.block_x(x0, z1),
-        f.block_x(x1, z0),
-    ];
-    let zs = [
-        f.block_z(x0, z0),
-        f.block_z(x1, z1),
-        f.block_z(x0, z1),
-        f.block_z(x1, z0),
-    ];
-    let tx0 = xs.iter().min().copied().unwrap_or(0) - pad - rx;
-    let tx1 = xs.iter().max().copied().unwrap_or(0) + 1 + pad + rx;
-    let tz0 = zs.iter().min().copied().unwrap_or(0) - pad - rz;
-    let tz1 = zs.iter().max().copied().unwrap_or(0) + 1 + pad + rz;
-    let (ylo, yhi) = (y0 - pad - ry, y1 + 1 + pad);
-    let v0 = p.v_turned(f64::from(yhi), f64::from(tz0));
-    let v1 = p.v_turned(f64::from(ylo), f64::from(tz1));
+    // A quarter turn takes opposite corners of a box to opposite corners.
+    let (ax, bx) = (f.block_x(x0, z0), f.block_x(x1, z1));
+    let (az, bz) = (f.block_z(x0, z0), f.block_z(x1, z1));
+    let (tx0, tx1, tz0, tz1) = (ax.min(bx), ax.max(bx), az.min(bz), az.max(bz));
+    let cave = layer != TileKey::SURFACE;
+    let (rx, rz, ry) = if cave { (0, 0, 0) } else { shadow_reach() };
+    let light = if cave || roof.is_some() {
+        LIGHT_REACH
+    } else {
+        0
+    };
+    let around = light.max(if cave { 0 } else { SKY_REACH }) + 1;
+    let u0 = tx0 - around;
+    let u1 = tx1 + 1 + around.max(rx + 1);
+    let north = tz0 - around.max(rz + 1);
+    let south = tz1 + 1 + around;
+    let mut top = y1 + 2 + light;
+    let mut bottom = y0 - 1 - around.max(ry);
+    if cave {
+        top = top.min(layer);
+        bottom = bottom.max(layer - CAVE_DEPTH - 1);
+    } else if let Some(roof) = roof {
+        top = top.min(roof);
+    }
+    if top < bottom {
+        return Vec::new();
+    }
+    let (u0, u1) = (f64::from(u0), f64::from(u1));
+    let v0 = p.v_turned(f64::from(top), f64::from(north));
+    let v1 = p.v_turned(f64::from(bottom), f64::from(south));
     let units = f64::from(TILE_UNITS);
-    let (u_lo, u_hi) = (
-        (f64::from(tx0) / units).floor() as i32,
-        (f64::from(tx1) / units).floor() as i32,
-    );
-    let (v_lo, v_hi) = ((v0 / units).floor() as i32, (v1 / units).floor() as i32);
+    let patch_units = PATCH as f64 / f64::from(PIXELS_PER_UNIT);
     let mut out = Vec::new();
-    for v in v_lo..=v_hi {
-        for u in u_lo..=u_hi {
-            out.push(TileKey::new(layer, u, v));
+    for v in (v0 / units).floor() as i32..=(v1 / units).floor() as i32 {
+        for u in (u0 / units).floor() as i32..=(u1 / units).floor() as i32 {
+            let key = TileKey::new(layer, u, v);
+            let (mu, mv) = (key.min_u(), key.min_v());
+            let patches = Patches::rect(
+                ((u0 - mu) / patch_units).floor() as i64,
+                ((v0 - mv) / patch_units).floor() as i64,
+                ((u1 - mu) / patch_units).floor() as i64,
+                ((v1 - mv) / patch_units).floor() as i64,
+            );
+            if !patches.is_empty() {
+                out.push((key, patches));
+            }
         }
     }
     out
@@ -1372,9 +1422,46 @@ pub(crate) mod tests {
     fn edits_touch_the_tiles_they_show_in() {
         let p = Projection::new(50.0, Facing::North);
         let (key, _) = pixel_of(&p, 10.5, 70.0, 10.5);
-        let touched = tiles_touched(&p, TileKey::SURFACE, [10, 70, 10], [10, 70, 10]);
-        assert!(touched.contains(&key));
-        assert!(touched.len() <= 9, "{}", touched.len());
+        let (_, pixel) = pixel_of(&p, 10.5, 70.0, 10.5);
+        let size = TILE_PIXELS as usize;
+        let touched = touched(&p, TileKey::SURFACE, None, [10, 70, 10], [10, 70, 10]);
+        let (_, patches) = touched
+            .iter()
+            .find(|(k, _)| *k == key)
+            .expect("its own tile");
+        assert!(patches.contains(pixel % size / PATCH, pixel / size / PATCH));
+        assert!(touched.len() <= 4, "{}", touched.len());
+        // One block reaches a few patches, not whole tiles.
+        let all: u32 = touched.iter().map(|(_, p)| p.count()).sum();
+        assert!(all < 64, "{all}");
+    }
+
+    #[test]
+    fn patches_bake_as_the_whole_tile_does() {
+        let world = flat_world(2, true);
+        let looks = test_looks();
+        let settings = BakeSettings {
+            style: MapStyle::DEFAULT,
+            projection: Projection::new(MapStyle::DEFAULT.pitch_degrees, Facing::East),
+            fast: true,
+            fog_of_war: false,
+        };
+        let (key, _) = pixel_of(&settings.projection, 10.5, 80.0, 10.5);
+        let whole = Baker::bake(key, &world, &looks, &settings);
+        let patches = Patches::rect(2, 3, 6, 9);
+        let mut pixels = vec![0u32; whole.pixels.len()];
+        Baker::bake_into(key, &world, &looks, &settings, &patches, &mut pixels);
+        let size = TILE_PIXELS as usize;
+        let mut baked = 0;
+        for (i, (&a, &b)) in pixels.iter().zip(&whole.pixels).enumerate() {
+            if patches.contains(i % size / PATCH, i / size / PATCH) {
+                assert_eq!(a, b, "pixel {i}");
+                baked += usize::from(a >> 24 != 0);
+            } else {
+                assert_eq!(a, 0, "outside the patches");
+            }
+        }
+        assert!(baked > 0);
     }
 
     #[test]

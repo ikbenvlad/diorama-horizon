@@ -7,7 +7,7 @@ use diorama_engine::projection::Facing;
 use diorama_engine::session::{LOAD_DELAY, MapSession, SessionConfig};
 use diorama_engine::style::MapStyle;
 use diorama_engine::tile::TileKey;
-use diorama_engine::view::{Fog, View, lod_for};
+use diorama_engine::view::{Fog, Look, View, lod_for};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -222,14 +222,24 @@ fn main() {
     let bake_started = Instant::now();
     loop {
         s.tick(Instant::now() + LOAD_DELAY, player);
-        s.compose(&view, &Fog::default(), &mut out);
+        s.compose(
+            &view,
+            &Look::new(false, false),
+            Some(&Fog::default()),
+            &mut out,
+        );
         let (d, wt, b) = s.busy();
         if d + wt + b == 0 && s.cache_version() > 0 {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    s.compose(&view, &Fog::default(), &mut out);
+    s.compose(
+        &view,
+        &Look::new(false, false),
+        Some(&Fog::default()),
+        &mut out,
+    );
     eprintln!("baked in {:.2?}", bake_started.elapsed());
     let mut rgba = Vec::new();
     diorama_engine::view::to_rgba(&out, &mut rgba);
