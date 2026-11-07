@@ -53,8 +53,6 @@ const CONVERT_PER_TICK: usize = 64;
 const FOG_FRAME: Duration = Duration::from_millis(100);
 /// How often the world is checked for chunks that came, changed or went.
 const TICK: Duration = Duration::from_millis(50);
-/// A waypoint pin's height in GUI pixels.
-const PIN_H: f32 = 10.0;
 /// How long a note on the fullscreen map stays.
 const TOAST: Duration = Duration::from_secs(3);
 
@@ -1589,75 +1587,218 @@ pub(super) fn frame(game: &mut Game<'_>, _elapsed: Duration) {
     }
 }
 
-/// The player arrow: the map item's player marker, turned to where they look on this map.
-fn arrow(game: &Game<'_>, batch: &mut HudBatch, at: [f32; 2], yaw: f32, facing: Facing, size: f32) {
-    let Some(r) = game
-        .gui
-        .atlas
-        .sprites
-        .get("map/decorations/player")
-        .copied()
-    else {
-        game.native_fill(batch, [at[0] - 2.0, at[1] - 2.0, 4.0, 4.0], 0xFFFF_FFFF);
-        return;
-    };
-    // Its arrow points down the texture, so up on screen is half a turn; the map's facing turns it back.
-    let degrees = yaw + 180.0 - 90.0 * facing.turns() as f32 + 180.0;
-    let (s, c) = degrees.to_radians().sin_cos();
-    let p = |dx: f32, dy: f32| [at[0] + dx * c - dy * s, at[1] + dx * s + dy * c];
-    let h = size / 2.0;
-    batch.quad(
-        [p(-h, h), p(h, h), p(h, -h), p(-h, -h)],
-        [[r.u0, r.v0], [r.u1, r.v0], [r.u1, r.v1], [r.u0, r.v1]],
-        u32::MAX,
+// ---------------------------------------------------------------------------------------------
+// The player arrow, the minimap's frame and the waypoint pins, drawn from the engine's shapes.
+
+use diorama_engine::arrow::{ACCENTS, Poly, voxel};
+use diorama_engine::chrome;
+use diorama_engine::pin_art::{self, PinImage};
+use std::rc::Rc;
+
+/// A pin's picture as filled runs, with the spot it marks and the box its initials go in, in pin
+/// pixels from its top left (one pin pixel is one GUI pixel, as upstream draws them).
+struct PinDrawing {
+    runs: Vec<(i32, i32, i32, u32)>,
+    anchor: [f32; 2],
+    label: [i32; 4],
+}
+
+impl PinDrawing {
+    fn of(img: &PinImage) -> PinDrawing {
+        PinDrawing {
+            runs: pin_art::runs(img),
+            anchor: img.anchor,
+            label: img.label,
+        }
+    }
+}
+
+/// What a pin's picture depends on: colour 0xRRGGBB, death, head size, stretch, and for a badge
+/// held at a view's edge the caret's step.
+type PinKey = (u32, bool, i32, i32, Option<i32>);
+/// What the arrow's polygons depend on: heading in whole degrees, size, the camera's sine and
+/// cosine, and the accent.
+type ArrowKey = (i32, u32, u64, u64, u32);
+
+/// Arrows and pins made once and drawn every frame after.
+#[derive(Default)]
+struct Art {
+    arrows: HashMap<ArrowKey, Rc<Vec<Poly>>>,
+    pins: HashMap<PinKey, Rc<PinDrawing>>,
+}
+
+/// More than this many cached shapes (a new camera pitch, many colours) and the cache starts over.
+const ART_CACHE: usize = 4096;
+
+thread_local! {
+    static ART: RefCell<Art> = RefCell::new(Art::default());
+}
+
+/// The player arrow: the voxel dart facing where they look on this map, centred on `at`, `size`
+/// GUI pixels from the centre to the tip of upstream's flat arrow (5 on the minimap, 6 on the
+/// fullscreen map; Markers.java).
+fn arrow(
+    game: &Game<'_>,
+    batch: &mut HudBatch,
+    at: [f32; 2],
+    yaw: f32,
+    projection: &Projection,
+    size: f32,
+    colour: usize,
+) {
+    // Minecraft's yaw (0 south, 90 west) turned to the map (Markers.onMap), in 1° steps.
+    let heading = (yaw - 90.0 * projection.facing.turns() as f32).round() as i32;
+    let heading = heading.rem_euclid(360);
+    let accent = ACCENTS[colour % ACCENTS.len()];
+    let (sin, cos) = (projection.sin, projection.cos);
+    let key = (
+        heading,
+        size.to_bits(),
+        sin.to_bits(),
+        cos.to_bits(),
+        accent,
     );
+    let polys = ART.with(|a| {
+        let mut a = a.borrow_mut();
+        if a.arrows.len() >= ART_CACHE && !a.arrows.contains_key(&key) {
+            a.arrows.clear();
+        }
+        a.arrows
+            .entry(key)
+            .or_insert_with(|| Rc::new(voxel(f64::from(heading), size, sin, cos, accent)))
+            .clone()
+    });
+    for p in polys.iter() {
+        let pts = p.pts.map(|[dx, dy]| [at[0] + dx, at[1] + dy]);
+        game.native_quad(batch, pts, p.argb);
+    }
 }
 
-/// A waypoint pin's box in GUI pixels: centred on `at`, or standing on it with a tail beneath.
-fn pin_box(game: &Game<'_>, label: &str, at: [f32; 2], centred: bool) -> [f32; 4] {
-    let w = (game.native_text_width(label) + 4.0).max(PIN_H);
-    let top = if centred {
-        at[1] - PIN_H / 2.0
+/// The classic frame round the minimap, over the map's edge: two one-pixel lines, a square's as
+/// rectangles, a round one's as rings of quads (MinimapFrames.java).
+fn minimap_frame(game: &Game<'_>, batch: &mut HudBatch, at: [f32; 2], size: f32, round: bool) {
+    if round {
+        let r = size / 2.0;
+        for (q, argb) in chrome::round(at[0] + r, at[1] + r, r) {
+            game.native_quad(batch, q, argb);
+        }
     } else {
-        at[1] - PIN_H - 2.0
-    };
-    [at[0] - w / 2.0, top, w, PIN_H]
+        let [x, y] = at.map(|v| v.round() as i32);
+        for ([x0, y0, x1, y1], argb) in chrome::square(x, y, size.round() as i32) {
+            let rect = [x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32];
+            game.native_fill(batch, rect, argb);
+        }
+    }
 }
 
-/// Draws a waypoint's pin: a box in its colour with its letters, faded when it is held at the
-/// edge of the view.
+/// The compass letters on the minimap, each on a dark box, north in red (MinimapHud.java:267-282).
+fn minimap_compass(game: &Game<'_>, batch: &mut HudBatch, at: [f32; 2], size: f32, facing: Facing) {
+    let [x, y] = at.map(|v| v.round() as i32);
+    let advance = |c: char| game.native_text_width(&c.to_string()).round() as i32;
+    for l in chrome::compass(x, y, size.round() as i32, facing.turns(), advance) {
+        let [x0, y0, x1, y1] = l.back;
+        let back = [x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32];
+        game.native_fill(batch, back, chrome::LETTER_BOX);
+        let text = l.letter.to_string();
+        let rgb = l.argb & 0xFF_FFFF;
+        game.native_text(batch, &text, [l.x as f32, l.y as f32], rgb, false);
+    }
+}
+
+/// The width of a string's ink: its advance less the one-pixel gap after the last glyph.
+fn ink(game: &Game<'_>, text: &str) -> i32 {
+    game.native_text_width(text).round() as i32 - 1
+}
+
+/// How much wider than round a waypoint's head of `head` is drawn to hold its initials; deaths
+/// show a headstone, never initials (Pins.stretch).
+fn pin_stretch(game: &Game<'_>, w: &Waypoint, head: i32) -> i32 {
+    let label = w.label();
+    if w.kind == waypoint::Kind::Death || label.is_empty() {
+        return 0;
+    }
+    pin_art::stretch_for(head, ink(game, &label))
+}
+
+/// What a standing pin with its point on `at` covers, x0, y0, x1, y1 in GUI pixels: its head
+/// above, its shadow below (Pins.standingBox).
+fn pin_box(head: i32, stretch: i32, at: [f32; 2]) -> [f32; 4] {
+    let head = pin_art::standing_head(head);
+    let above = (head + if head == pin_art::SMALL { 5 } else { 6 }) as f32;
+    let side = (head + 4 + stretch) as f32 / 2.0;
+    [
+        at[0] - side,
+        at[1] - above,
+        at[0] + side,
+        at[1] + pin_art::SHADOW as f32,
+    ]
+}
+
+/// Draws a waypoint's pin with a head of `head`: standing with its point on `at`, or, given the
+/// angle (radians, screen space, 0 is right) toward where it is, a badge centred on `at` with a
+/// caret pointing that way, for one held at the edge of a view. Its initials go on top
+/// (Pins.standing, Pins.edge, Pins.draw).
 fn draw_pin(
     game: &Game<'_>,
     batch: &mut HudBatch,
     w: &Waypoint,
     at: [f32; 2],
-    centred: bool,
-    faded: bool,
-) -> [f32; 4] {
-    let label = w.label();
-    let b @ [x, y, bw, bh] = pin_box(game, &label, at, centred);
-    let alpha: u32 = if faded { 0xA0 } else { 0xFF };
-    let edge = (alpha << 24) | 0x10_1418;
-    game.native_fill(batch, [x - 1.0, y - 1.0, bw + 2.0, bh + 2.0], edge);
-    game.native_fill(batch, b, (alpha << 24) | (w.color & 0xFF_FFFF));
-    if !centred {
-        game.native_fill(batch, [at[0] - 1.0, y + bh + 1.0, 2.0, 1.0], edge);
+    head: i32,
+    caret: Option<f64>,
+) {
+    let colour = w.color & 0xFF_FFFF;
+    let death = w.kind == waypoint::Kind::Death;
+    let stretch = pin_stretch(game, w, head);
+    let step = caret.map(pin_art::caret_step);
+    let key = (colour, death, head, stretch, step);
+    let pin = ART.with(|a| {
+        let mut a = a.borrow_mut();
+        if a.pins.len() >= ART_CACHE && !a.pins.contains_key(&key) {
+            a.pins.clear();
+        }
+        a.pins
+            .entry(key)
+            .or_insert_with(|| {
+                let img = match step {
+                    Some(step) => pin_art::badge(
+                        colour,
+                        death,
+                        head,
+                        stretch,
+                        Some((pin_art::caret_angle(step), pin_art::caret_size(head))),
+                        None,
+                    ),
+                    None => pin_art::standing(colour, death, head, stretch),
+                };
+                Rc::new(PinDrawing::of(&img))
+            })
+            .clone()
+    });
+    // A colour saved with no alpha at all is meant opaque; otherwise the pin keeps its alpha.
+    let alpha = match w.color >> 24 {
+        0 => 0xFF,
+        a => a,
+    };
+    let (ox, oy) = (at[0] - pin.anchor[0], at[1] - pin.anchor[1]);
+    for &(x, y, width, argb) in &pin.runs {
+        let a = (argb >> 24) * alpha / 0xFF;
+        let rect = [ox + x as f32, oy + y as f32, width as f32, 1.0];
+        game.native_fill(batch, rect, (a << 24) | (argb & 0xFF_FFFF));
     }
-    let (r, g, bl) = (
-        (w.color >> 16) & 0xFF,
-        (w.color >> 8) & 0xFF,
-        w.color & 0xFF,
-    );
-    let light = 299 * r + 587 * g + 114 * bl > 150_000;
-    let tw = game.native_text_width(&label);
-    game.native_text(
-        batch,
-        &label,
-        [x + (bw - tw) / 2.0, y + 1.0],
-        if light { 0x10_1418 } else { 0xFF_FFFF },
-        !light,
-    );
-    b
+    let [x0, y0, x1, y1] = pin.label;
+    if death || x1 <= x0 {
+        return;
+    }
+    let label = w.label();
+    if label.is_empty() {
+        return;
+    }
+    // Centred on their ink; capitals and digits are 7 pixels tall from the top of the line.
+    let light = pin_art::light(colour);
+    let tx = pin_art::centred(x0, x1, ink(game, &label));
+    let ty = pin_art::centred(y0, y1, 7);
+    let rgb = if light { pin_art::INK } else { 0xFF_FFFF };
+    game.native_text(batch, &label, [ox + tx as f32, oy + ty as f32], rgb, !light);
 }
 
 /// How far above or below the player the radar looks, in blocks.
@@ -1838,12 +1979,16 @@ fn world_pins(
     if camera.dimension != dimension {
         return;
     }
+    // A pin stands above its spot, so it is still on screen with its spot a little off it
+    // (WaypointHud.java).
+    let margin = 28.0;
     let mut placed: Vec<(f64, [f32; 2], &Waypoint)> = pins
         .iter()
         .filter_map(|(_, w)| {
             let [x, y, z] = w.point();
             let at = project(&camera, [x, y + 1.0, z], size)?;
-            let on_screen = (0.0..size[0]).contains(&at[0]) && (0.0..size[1]).contains(&at[1]);
+            let on_screen = (-margin..size[0] + margin).contains(&at[0])
+                && (-margin..size[1] + margin).contains(&at[1]);
             on_screen.then(|| (w.distance_to(camera.position), at, w))
         })
         .collect();
@@ -1857,14 +2002,14 @@ fn world_pins(
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(i, _)| i);
     for (i, (d, at, w)) in placed.iter().enumerate() {
-        draw_pin(game, batch, w, *at, false, false);
+        draw_pin(game, batch, w, *at, pin_art::LARGE, None);
         let text = if Some(i) == aimed {
             format!("{} ({d:.0} m)", w.name)
         } else {
             format!("{d:.0} m")
         };
         let tw = game.native_text_width(&text);
-        let ty = at[1] + 3.0;
+        let ty = at[1] + 1.0 + pin_art::SHADOW as f32;
         game.native_fill(
             batch,
             [at[0] - tw / 2.0 - 2.0, ty - 1.0, tw + 4.0, 10.0],
@@ -1937,13 +2082,6 @@ pub(super) fn hud(game: &mut Game<'_>, batch: &mut HudBatch, corners: &mut Corne
     let text_h = 10.0 * lines.len() as f32;
     let (x, y) = corners.place(corner, size, size + text_h);
     let map_y = if corner.top() { y } else { y + text_h };
-    if !settings.round && settings.frame != Frame::None {
-        game.native_fill(
-            batch,
-            [x - 1.0, map_y - 1.0, size + 2.0, size + 2.0],
-            0xFF00_0000,
-        );
-    }
     let img = [shown.view.width as f32, shown.view.height as f32];
     game.native_sprite(
         batch,
@@ -1951,25 +2089,9 @@ pub(super) fn hud(game: &mut Game<'_>, batch: &mut HudBatch, corners: &mut Corne
         [0.0, 0.0, img[0], img[1]],
         [x, map_y, size, size],
     );
-    // The compass: the map looks toward its facing, so that is up, and the rest go clockwise.
-    let letter = |f: Facing| match f {
-        Facing::North => "N",
-        Facing::East => "E",
-        Facing::South => "S",
-        Facing::West => "W",
-    };
-    let (mx, my, half) = (x + size / 2.0, map_y + size / 2.0, size / 2.0 - 5.0);
-    let compass: &[(f32, f32)] = if settings.compass {
-        &[(0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)]
-    } else {
-        &[]
-    };
-    for (turn, &(dx, dy)) in compass.iter().enumerate() {
-        let text = letter(projection.facing.next(turn as i32));
-        let tw = game.native_text_width(text);
-        let at = [mx + dx * half - tw / 2.0, my + dy * half - 4.0];
-        let rgb = if turn == 0 { 0xFF_5555 } else { 0xE0_E0E0 };
-        game.native_text(batch, text, at, rgb, true);
+    // Over the map's edge, under what's marked on it.
+    if settings.frame != Frame::None {
+        minimap_frame(game, batch, [x, map_y], size, settings.round);
     }
     let per_px = img[0] / size;
     if settings.radar {
@@ -1998,24 +2120,52 @@ pub(super) fn hud(game: &mut Game<'_>, batch: &mut HudBatch, corners: &mut Corne
             false,
         );
     }
-    // Waypoints: where they are, or held at the edge toward them.
-    let inset = f64::from((PIN_H / 2.0 + 1.0) * per_px);
+    // Waypoints: a pin standing where it fits whole, else a badge at the edge pointing the way
+    // (WaypointOverlay.layout).
+    let (cx, cy, r) = (x + size / 2.0, map_y + size / 2.0, size / 2.0);
+    let head = pin_art::SMALL;
     for (_, w) in &pins {
         let [px, py, pz] = w.point();
         let (u, v) = (projection.u(px, pz), projection.v(px, py, pz));
-        if let Some(spot) = waypoint::pin_spot(&shown.view, u, v, inset, true) {
-            let at = [x + spot.x as f32 / per_px, map_y + spot.y as f32 / per_px];
-            draw_pin(game, batch, w, at, true, spot.edge);
+        let (ix, iy) = shown.view.image_xy(u, v);
+        let at = [x + ix as f32 / per_px, map_y + iy as f32 / per_px];
+        let stretch = pin_stretch(game, w, head);
+        let [x0, y0, x1, y1] = pin_box(head, stretch, at);
+        let fits = if settings.round {
+            let inside = |px: f32, py: f32| (px - cx).hypot(py - cy) <= r;
+            inside(x0, y0) && inside(x1, y0) && inside(x0, y1) && inside(x1, y1)
+        } else {
+            x0 >= x && x1 <= x + size && y0 >= map_y && y1 <= map_y + size
+        };
+        if fits {
+            draw_pin(game, batch, w, at, head, None);
+            continue;
         }
+        // Pulled in by how far the badge and its caret reach from its centre.
+        let inset = (head + stretch) as f32 / 2.0 + 6.0;
+        let (dx, dy) = (at[0] - cx, at[1] - cy);
+        let reach = if settings.round {
+            (dx.hypot(dy) / (r - inset).max(1.0)).max(1.0)
+        } else {
+            let half = (r - inset).max(1.0);
+            (dx.abs().max(dy.abs()) / half).max(1.0)
+        };
+        let (bx, by) = (cx + dx / reach, cy + dy / reach);
+        let angle = f64::from(by - cy).atan2(f64::from(bx - cx));
+        draw_pin(game, batch, w, [bx, by], head, Some(angle));
     }
     arrow(
         game,
         batch,
-        [x + size / 2.0, map_y + size / 2.0],
+        [cx, cy],
         player.yaw,
-        projection.facing,
-        8.0,
+        &projection,
+        5.0,
+        settings.arrow_colour,
     );
+    if settings.compass {
+        minimap_compass(game, batch, [x, map_y], size, projection.facing);
+    }
     let top = if corner.top() { map_y + size + 2.0 } else { y };
     for (i, text) in lines.iter().enumerate() {
         let w = game.native_text_width(text);
@@ -2458,24 +2608,25 @@ pub(super) fn screen_draw(game: &Game<'_>, batch: &mut HudBatch, screen: &Native
             .rposition(|(_, wp, at)| on_map && pin_hit(game, wp, *at, screen.mouse));
         for (i, (_, wp, at)) in placed.iter().enumerate() {
             if Some(i) != hovered {
-                draw_pin(game, batch, wp, *at, false, false);
+                draw_pin(game, batch, wp, *at, pin_art::LARGE, None);
             }
         }
         if let Some((_, wp, at)) = hovered.map(|i| &placed[i]) {
-            let [x, y, bw, bh] = draw_pin(game, batch, wp, *at, false, false);
+            draw_pin(game, batch, wp, *at, pin_art::LARGE, None);
             let mut name = wp.name.clone();
             if let Some(p) = &player {
                 name = format!("{name} ({:.0} m)", wp.distance_to([p.x, p.y, p.z]));
             }
+            // Under the pin's shadow (WaypointOverlay.draw).
             let tw = game.native_text_width(&name);
-            let (tx, ty) = (x + bw / 2.0 - tw / 2.0, y + bh + 4.0);
+            let (tx, ty) = (at[0] - tw / 2.0, at[1] + pin_art::SHADOW as f32 + 1.0);
             game.native_fill(batch, [tx - 2.0, ty - 1.0, tw + 4.0, 10.0], 0xA000_0000);
             game.native_text(batch, &name, [tx, ty], 0xFFFFFF, false);
         }
     }
     if let (Some(p), Some(proj), None) = (player.as_ref(), projection, &viewing) {
         let at = to_gui(proj.u(p.x, p.z), proj.v(p.x, p.y, p.z));
-        arrow(game, batch, at, p.yaw, proj.facing, 10.0);
+        arrow(game, batch, at, p.yaw, &proj, 6.0, settings.arrow_colour);
     }
     // What's under the pointer: the block the map shows there, else the ground at the player's height.
     let mut lines = vec![if let Some(d) = &viewing {
@@ -2587,10 +2738,17 @@ fn screen_pins(
         .collect()
 }
 
-/// Whether the pointer is on a standing pin: its box, down to the point it stands on.
+/// Whether the pointer is on a standing pin on the fullscreen map: near its head (along the middle
+/// line of one widened for its initials) or the spot its point touches (WaypointOverlay.under).
 fn pin_hit(game: &Game<'_>, w: &Waypoint, at: [f32; 2], mouse: [f32; 2]) -> bool {
-    let [x, y, bw, _] = pin_box(game, &w.label(), at, false);
-    (x - 1.0..=x + bw + 1.0).contains(&mouse[0]) && (y - 1.0..=at[1] + 1.0).contains(&mouse[1])
+    let head = pin_art::LARGE;
+    let stretch = pin_stretch(game, w, head) as f32;
+    let along = ((at[0] - mouse[0]).abs() - stretch / 2.0).max(0.0);
+    let head_y = at[1] - pin_art::head_above(head);
+    let d = along
+        .hypot(head_y - mouse[1])
+        .min((at[0] - mouse[0]).hypot(at[1] - mouse[1]));
+    d <= head as f32 / 2.0 + 2.0
 }
 
 /// The pin under the pointer on the fullscreen map, the topmost: its waypoint's index.
