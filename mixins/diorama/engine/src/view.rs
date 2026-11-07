@@ -2,9 +2,11 @@
 //! fog over everything the map has no data for. Horizon gives native mods one image in the HUD atlas, so the
 //! minimap and the fullscreen map are composed here and uploaded whole when they change.
 
-use crate::projection::{PIXELS_PER_UNIT, TILE_PIXELS};
+use crate::fog::FogLayer;
+use crate::projection::{COVERAGE_CELLS, PIXELS_PER_UNIT, TILE_PIXELS};
 use crate::tile::{self, TileImage, TileKey};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Which part of the map an image shows, and how large.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -122,12 +124,21 @@ fn unpremultiply(p: u32) -> u32 {
     (a << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
-/// Tiles held for drawing, with their mip chains; the least recently drawn go first.
+/// Coverage kept for the fog, per tile: many more than the tiles held, at 4 KiB each.
+const COVERAGE_TILES: usize = 2048;
+
+/// The mip level whose alpha is a tile's coverage: [`COVERAGE_CELLS`] a side.
+const COVERAGE_LEVEL: usize = (TILE_PIXELS / COVERAGE_CELLS).trailing_zeros() as usize;
+
+/// Tiles held for drawing, with their mip chains; the least recently drawn go first. Besides, the
+/// coverage of many more tiles, which the fog reads (MapTile.coverage).
 pub struct TileCache {
     tiles: HashMap<TileKey, Cached>,
+    /// Each tile's known share per coverage cell, 0 to 255, and when it came.
+    coverage: HashMap<TileKey, (Arc<[u8]>, u64)>,
     clock: u64,
     capacity: usize,
-    /// Goes up whenever a tile is added or replaced.
+    /// Goes up whenever a tile or its coverage is added, replaced or dropped.
     pub version: u64,
 }
 
@@ -135,10 +146,70 @@ impl TileCache {
     pub fn new(capacity: usize) -> TileCache {
         TileCache {
             tiles: HashMap::new(),
+            coverage: HashMap::new(),
             clock: 0,
             capacity,
             version: 0,
         }
+    }
+
+    /// The known share of each of a tile's coverage cells, from its pixels.
+    pub fn coverage_of(pixels: &[u32]) -> Arc<[u8]> {
+        let mut level = pixels.to_vec();
+        let mut size = TILE_PIXELS as usize;
+        while size > COVERAGE_CELLS as usize {
+            level = tile::shrink(&level, size);
+            size /= 2;
+        }
+        level.iter().map(|p| (p >> 24) as u8).collect()
+    }
+
+    /// Keeps a tile's coverage for the fog without its pixels: for tiles round the view, which
+    /// the clouds' climb reads.
+    pub fn insert_coverage(&mut self, key: TileKey, coverage: Arc<[u8]>) {
+        self.clock += 1;
+        self.version += 1;
+        self.coverage.insert(key, (coverage, self.clock));
+        if self.coverage.len() > COVERAGE_TILES {
+            let mut by_age: Vec<(u64, TileKey)> = self
+                .coverage
+                .iter()
+                .filter(|(k, _)| !self.tiles.contains_key(k))
+                .map(|(k, c)| (c.1, *k))
+                .collect();
+            by_age.sort_unstable();
+            let extra = self.coverage.len() - COVERAGE_TILES;
+            for (_, k) in by_age.into_iter().take(extra) {
+                self.coverage.remove(&k);
+            }
+        }
+    }
+
+    pub fn has_coverage(&self, key: &TileKey) -> bool {
+        self.coverage.contains_key(key)
+    }
+
+    /// The coverage held of tiles of `layer` that meet the map rectangle from (u0, v0) to
+    /// (u1, v1), at any level.
+    pub fn coverage_in(
+        &self,
+        layer: i32,
+        u0: f64,
+        v0: f64,
+        u1: f64,
+        v1: f64,
+    ) -> Vec<(TileKey, Arc<[u8]>)> {
+        self.coverage
+            .iter()
+            .filter(|(k, _)| {
+                k.layer == layer
+                    && k.min_u() < u1
+                    && k.min_u() + k.units() > u0
+                    && k.min_v() < v1
+                    && k.min_v() + k.units() > v0
+            })
+            .map(|(k, c)| (*k, c.0.clone()))
+            .collect()
     }
 
     pub fn insert(&mut self, image: &TileImage) {
@@ -147,20 +218,25 @@ impl TileCache {
 
     pub fn insert_pixels(&mut self, key: TileKey, pixels: &[u32]) {
         self.clock += 1;
-        self.version += 1;
+        let mips: Vec<Vec<u32>> = tile::mips(pixels, TILE_PIXELS as usize)
+            .into_iter()
+            .map(|mut level| {
+                level.iter_mut().for_each(|p| *p = premultiply(*p));
+                level
+            })
+            .collect();
+        let coverage: Arc<[u8]> = mips[COVERAGE_LEVEL]
+            .iter()
+            .map(|p| (p >> 24) as u8)
+            .collect();
         self.tiles.insert(
             key,
             Cached {
-                mips: tile::mips(pixels, TILE_PIXELS as usize)
-                    .into_iter()
-                    .map(|mut level| {
-                        level.iter_mut().for_each(|p| *p = premultiply(*p));
-                        level
-                    })
-                    .collect(),
+                mips,
                 used: self.clock,
             },
         );
+        self.insert_coverage(key, coverage);
         if self.tiles.len() > self.capacity {
             let mut by_age: Vec<(u64, TileKey)> =
                 self.tiles.iter().map(|(k, c)| (c.used, *k)).collect();
@@ -182,12 +258,14 @@ impl TileCache {
             .map(|c| c.mips[0].iter().map(|p| unpremultiply(*p)).collect())
     }
 
+    /// Drops a held tile. Its coverage stays for the fog until a new one replaces it.
     pub fn remove(&mut self, key: &TileKey) {
         if self.tiles.remove(key).is_some() {
             self.version += 1;
         }
     }
 
+    /// Drops the held tiles `drop` picks; their coverage stays, as [`Self::remove`].
     pub fn remove_where(&mut self, drop: impl Fn(&TileKey) -> bool) {
         self.tiles.retain(|k, _| !drop(k));
         self.version += 1;
@@ -195,6 +273,7 @@ impl TileCache {
 
     pub fn clear(&mut self) {
         self.tiles.clear();
+        self.coverage.clear();
         self.version += 1;
     }
 
@@ -215,72 +294,6 @@ impl TileCache {
             }
         }
     }
-}
-
-/// The fog drawn over unknown ground: drifting clouds, in map space so they move with the map.
-#[derive(Clone, Copy, Debug)]
-pub struct Fog {
-    /// 0xRRGGBB of the clouds' light and shadow.
-    pub light: u32,
-    pub shade: u32,
-    /// Seconds, for the drift.
-    pub time: f64,
-}
-
-impl Default for Fog {
-    fn default() -> Self {
-        Fog {
-            light: 0xE4E9EE,
-            shade: 0xA9B3BF,
-            time: 0.0,
-        }
-    }
-}
-
-impl Fog {
-    pub const CAVE: Fog = Fog {
-        light: 0x2A2B30,
-        shade: 0x141519,
-        time: 0.0,
-    };
-
-    /// ABGR fog colour at map point (u, v).
-    fn at(&self, u: f64, v: f64) -> u32 {
-        let drift = self.time * 0.6;
-        let n = 0.6 * value_noise(u / 24.0 + drift / 24.0, v / 24.0)
-            + 0.3 * value_noise(u / 9.0 - drift / 15.0, v / 9.0 + 3.7)
-            + 0.1 * value_noise(u / 3.5, v / 3.5 + drift / 10.0);
-        let t = (n as f32).clamp(0.0, 1.0);
-        let mix = |shift: u32| {
-            let a = ((self.shade >> shift) & 0xFF) as f32;
-            let b = ((self.light >> shift) & 0xFF) as f32;
-            (a + (b - a) * t).round() as u32
-        };
-        0xFF00_0000 | (mix(0) << 16) | (mix(8) << 8) | mix(16)
-    }
-}
-
-fn hash2(x: i32, y: i32) -> f64 {
-    let mut h = (x as u32).wrapping_mul(0x8DA6_B343) ^ (y as u32).wrapping_mul(0xD816_3841);
-    h ^= h >> 13;
-    h = h.wrapping_mul(0x5bd1_e995);
-    h ^= h >> 15;
-    f64::from(h & 0xFFFF) / 65535.0
-}
-
-/// Smooth noise 0..1 on a unit lattice.
-fn value_noise(x: f64, y: f64) -> f64 {
-    let (x0, y0) = (x.floor(), y.floor());
-    let (fx, fy) = (x - x0, y - y0);
-    let (sx, sy) = (fx * fx * (3.0 - 2.0 * fx), fy * fy * (3.0 - 2.0 * fy));
-    let (ix, iy) = (x0 as i32, y0 as i32);
-    let a = hash2(ix, iy);
-    let b = hash2(ix + 1, iy);
-    let c = hash2(ix, iy + 1);
-    let d = hash2(ix + 1, iy + 1);
-    let top = a + (b - a) * sx;
-    let bottom = c + (d - c) * sx;
-    top + (bottom - top) * sy
 }
 
 /// What the map is drawn on and how: the colour behind the tiles, the night, and how opaque.
@@ -516,14 +529,15 @@ fn compose_threads() -> usize {
 }
 
 /// Draws `view` into `out` (ABGR, `view.width * view.height`): the tiles in `cache` over the
-/// backdrop of `look`, and `fog` where nothing at all is known. Partly known pixels blend into
-/// the backdrop. Tiles the view reads that are not in `cache` are returned, so they can be loaded
-/// or baked.
+/// backdrop of `look`, and the `fog` layer over that, as fog.fsh's colour blends over the map:
+/// `clamp(rgb / a) * a + ground * (1 - a)`. Where the layer doesn't reach, its flat fog colour
+/// covers the unknown share. Tiles the view reads that are not in `cache` are returned, so they
+/// can be loaded or baked.
 pub fn compose(
     view: &View,
     cache: &mut TileCache,
     look: &Look,
-    fog: Option<&Fog>,
+    fog: Option<&FogLayer>,
     out: &mut [u32],
 ) -> Vec<TileKey> {
     let (w, h) = (view.width, view.height);
@@ -546,11 +560,12 @@ pub fn compose(
                 .map(Vec::as_slice)
         })
         .collect();
+    let fog = fog.map(|layer| FogRead::new(layer, view));
     let painter = Painter {
         view,
         sampling: &sampling,
         images: &images,
-        fog,
+        fog: fog.as_ref(),
         opacity: look.opacity.clamp(0.0, 1.0),
         backdrop: look.backdrop_rgb(),
     };
@@ -579,13 +594,84 @@ pub fn compose(
     missing
 }
 
+/// How a view reads a fog layer: for each column and row, the layer texel before the pixel's
+/// middle and how far past it, or none outside the layer.
+struct FogRead<'a> {
+    layer: &'a FogLayer,
+    columns: Vec<Option<(usize, f32)>>,
+    rows: Vec<Option<(usize, f32)>>,
+    /// The flat fog colour, 0 to 1.
+    flat: [f32; 3],
+}
+
+impl FogRead<'_> {
+    fn new<'a>(layer: &'a FogLayer, view: &View) -> FogRead<'a> {
+        let g = &layer.grid;
+        let axis = |n: usize, min: f64, start: f64, texels: usize| -> Vec<Option<(usize, f32)>> {
+            (0..n)
+                .map(|i| {
+                    let f = (min + (i as f64 + 0.5) / view.zoom - start) / g.texel - 0.5;
+                    let last = texels as f64 - 1.0;
+                    (texels > 0 && f >= 0.0 && f <= last).then(|| {
+                        let i0 = f.floor().min(last - 1.0).max(0.0);
+                        (i0 as usize, (f - i0) as f32)
+                    })
+                })
+                .collect()
+        };
+        FogRead {
+            layer,
+            columns: axis(view.width, view.min_u(), g.start_u, g.w),
+            rows: axis(view.height, view.min_v(), g.start_v, g.h),
+            flat: std::array::from_fn(|c| ((layer.flat >> (8 * c)) & 0xFF) as f32 / 255.0),
+        }
+    }
+
+    /// The flat colour over the `unknown` share (0 to 1), premultiplied, 0 to 255: the fog
+    /// where the layer doesn't reach.
+    #[inline]
+    fn flat(&self, unknown: f32) -> [f32; 4] {
+        let a = unknown * 255.0;
+        [self.flat[0] * a, self.flat[1] * a, self.flat[2] * a, a]
+    }
+
+    /// The layer over image column `x` of a row, filtered between its texels, premultiplied, 0
+    /// to 255; none outside it.
+    #[inline]
+    fn at(&self, x: usize, row: Option<(usize, f32)>) -> Option<[f32; 4]> {
+        let (Some((i, tx)), Some((j, ty))) = (self.columns[x], row) else {
+            return None;
+        };
+        let g = &self.layer.grid;
+        let p = &self.layer.pixels;
+        let i1 = (i + 1).min(g.w - 1);
+        let j1 = (j + 1).min(g.h - 1);
+        let (a, b, c, d) = (
+            p[j * g.w + i],
+            p[j * g.w + i1],
+            p[j1 * g.w + i],
+            p[j1 * g.w + i1],
+        );
+        if a | b | c | d == 0 {
+            return Some([0.0; 4]);
+        }
+        let (wa, wb) = ((1.0 - tx) * (1.0 - ty), tx * (1.0 - ty));
+        let (wc, wd) = ((1.0 - tx) * ty, tx * ty);
+        Some(std::array::from_fn(|ch| {
+            let s = 8 * ch;
+            let t = |p: u32| ((p >> s) & 0xFF) as f32;
+            t(a) * wa + t(b) * wb + t(c) * wc + t(d) * wd
+        }))
+    }
+}
+
 /// What every row of one composed image needs.
 struct Painter<'a> {
     view: &'a View,
     sampling: &'a Sampling,
     /// Each tile's level as read, by row of tiles then column; none where it is missing.
     images: &'a [Option<&'a [u32]>],
-    fog: Option<&'a Fog>,
+    fog: Option<&'a FogRead<'a>>,
     opacity: f32,
     backdrop: [u64; 3],
 }
@@ -612,6 +698,7 @@ impl Painter<'_> {
         for (dy, row) in out.chunks_exact_mut(w).enumerate() {
             let y = y0 + dy;
             let row_taps = rows.of(y);
+            let fog_row = self.fog.and_then(|f| f.rows[y]);
             lines.clear();
             for tap in row_taps {
                 let at = tap.texel as usize * size;
@@ -636,6 +723,13 @@ impl Painter<'_> {
                         continue;
                     }
                 }
+                let layer = self.fog.and_then(|f| f.at(x, fog_row));
+                if opaque && let Some(f) = layer.filter(|f| f[3] >= 254.5) {
+                    // Under fog all over: the fog alone.
+                    let ch = |c: f32| (c.min(255.0) + 0.5) as u32;
+                    *px = 0xFF00_0000 | (ch(f[2]) << 16) | (ch(f[1]) << 8) | ch(f[0]);
+                    continue;
+                }
                 let column_taps = columns.of(x);
                 // Sums of premultiplied channels, each up to 255 * PIXEL_ONE. Along a row two
                 // channels share a word: a column's weights add up to AXIS_ONE, so each half
@@ -653,22 +747,17 @@ impl Painter<'_> {
                     g += (ga & 0xFFFF) * weight;
                     a += (ga >> 16) * weight;
                 }
-                *px = if a == 0 {
-                    // Nothing known here: fog, or the backdrop until there is fog.
-                    match self.fog {
-                        Some(fog) => {
-                            let u = view.min_u() + (x as f64 + 0.5) / view.zoom;
-                            let v = view.min_v() + (y as f64 + 0.5) / view.zoom;
-                            let f = fog.at(u, v);
-                            if opaque {
-                                f
-                            } else {
-                                (f & 0x00FF_FFFF) | (((255.0 * self.opacity).round() as u32) << 24)
-                            }
-                        }
-                        None if opaque => ground,
-                        None => 0,
+                if let Some(fog) = self.fog {
+                    let f = layer
+                        .unwrap_or_else(|| fog.flat(1.0 - (f64::from(a) / full as f64) as f32));
+                    if f[3] > 0.5 {
+                        *px = self.fogged([r, g, b, a], f);
+                        continue;
                     }
+                }
+                *px = if a == 0 {
+                    // Nothing known here: the backdrop.
+                    if opaque { ground } else { 0 }
                 } else if a == PIXEL_ONE as u32 * 255 {
                     // Known all over: the colour as it is.
                     let ch = |c: u32| (c + (PIXEL_ONE as u32 >> 1)) >> 16;
@@ -694,6 +783,34 @@ impl Painter<'_> {
                 };
             }
         }
+    }
+
+    /// The ground's premultiplied sums `[r, g, b, a]` with `fog` (premultiplied, 0 to 255) over
+    /// them: the tiles over the backdrop when opaque, else both as see-through as the look says.
+    #[inline]
+    fn fogged(&self, sums: [u32; 4], fog: [f32; 4]) -> u32 {
+        let per = 1.0 / PIXEL_ONE as f32;
+        let fa = fog[3].min(255.0);
+        let byte = |c: f32| (c.clamp(0.0, 255.0) + 0.5) as u32;
+        if self.opacity >= 1.0 {
+            let rest = 1.0 - fa / 255.0;
+            let unknown = 1.0 - sums[3] as f32 * per / 255.0;
+            let ch = |c: usize| {
+                let ground = sums[c] as f32 * per + self.backdrop[c] as f32 * unknown;
+                byte(fog[c].min(fa) + ground * rest)
+            };
+            return 0xFF00_0000 | (ch(2) << 16) | (ch(1) << 8) | ch(0);
+        }
+        let op = self.opacity;
+        let rest = 1.0 - fa / 255.0 * op;
+        let out: [f32; 4] =
+            std::array::from_fn(|c| fog[c].min(fa) * op + sums[c] as f32 * per * op * rest);
+        if out[3] <= 0.0 {
+            return 0;
+        }
+        let scale = 255.0 / out[3];
+        let ch = |c: usize| byte(out[c] * scale);
+        (byte(out[3]) << 24) | (ch(2) << 16) | (ch(1) << 8) | ch(0)
     }
 }
 
@@ -741,6 +858,11 @@ mod tests {
         night: 0.0,
         opacity: 1.0,
     };
+
+    /// Fog with no layer painted: the flat colour over whatever is unknown.
+    fn flat() -> FogLayer {
+        FogLayer::flat(crate::fog::FogKind::Clouds, TileKey::SURFACE, 0.0)
+    }
 
     /// A cache holding tiles (u, v) for u in `us` and v in `vs`, each painted by `paint(x, y)`
     /// over its own texels.
@@ -800,7 +922,7 @@ mod tests {
             ..view(2.0)
         };
         let mut out = vec![0u32; v.width * v.height];
-        let missing = compose(&v, &mut cache, &LOOK, Some(&Fog::default()), &mut out);
+        let missing = compose(&v, &mut cache, &LOOK, Some(&flat()), &mut out);
         // Left half is tile (0, 0), right half tile (1, 0), which is missing.
         assert_eq!(out[10 * v.width + 5], 0xFF00_FF00);
         assert_ne!(out[10 * v.width + 60], 0xFF00_FF00);
@@ -819,7 +941,7 @@ mod tests {
             ..view(2.0)
         };
         let mut out = vec![1u32; 32 * 32];
-        compose(&v, &mut cache, &LOOK, Some(&Fog::default()), &mut out);
+        compose(&v, &mut cache, &LOOK, Some(&flat()), &mut out);
         assert_eq!(out[0], 0);
         assert_ne!(out[16 * 32 + 16], 0);
     }
@@ -927,7 +1049,7 @@ mod tests {
             ..view(8.0)
         };
         let mut out = vec![0u32; v.width * v.height];
-        compose(&v, &mut cache, &LOOK, Some(&Fog::default()), &mut out);
+        compose(&v, &mut cache, &LOOK, None, &mut out);
         // Pixels lying on two known texels and two unknown, two texels to a pixel each way.
         let mut cache = filled(-1..2, -1..2, |x, _| if x % 2 == 0 { blue } else { 0 });
         let v = View {
@@ -935,7 +1057,7 @@ mod tests {
             ..view(2.0)
         };
         let mut out2 = vec![0u32; v.width * v.height];
-        compose(&v, &mut cache, &LOOK, Some(&Fog::default()), &mut out2);
+        compose(&v, &mut cache, &LOOK, None, &mut out2);
         for p in [out[100], out2[100], out2[777]] {
             assert_eq!(p >> 24, 255);
             for shift in [0, 8, 16] {
@@ -962,8 +1084,37 @@ mod tests {
         // Tile (1, 0) is missing: nothing behind it.
         assert_eq!(out[10 * v.width + 60], 0);
         // With fog, the fog is as see-through as the tiles.
-        compose(&v, &mut cache, &look, Some(&Fog::default()), &mut out);
+        compose(&v, &mut cache, &look, Some(&flat()), &mut out);
         assert_eq!(out[10 * v.width + 60] >> 24, 153);
+    }
+
+    #[test]
+    fn fog_layers_blend_over_the_ground() {
+        let mut cache = filled(-1..2, -1..2, |_, _| 0xFF00_8000);
+        let v = View {
+            lod: 0,
+            ..view(2.0)
+        };
+        // Half-see-through grey (premultiplied 0x40 of 0x80) over the left half of the view;
+        // the layer stops at the middle.
+        let mut grid = crate::fog::LayerGrid::for_view(&v);
+        grid.w = ((64.0 - grid.start_u) / grid.texel) as usize;
+        let fog = FogLayer {
+            grid,
+            pixels: vec![0x8040_4040; grid.w * grid.h],
+            ..flat()
+        };
+        let mut out = vec![0u32; v.width * v.height];
+        compose(&v, &mut cache, &LOOK, Some(&fog), &mut out);
+        // clamp(rgb / a) * a + ground * (1 - a): 0x40 + 0x80 * 0.5 in green, 0x40 elsewhere.
+        let p = out[10 * v.width + 5];
+        assert!((channel(p, 8) - 0x80).abs() <= 1, "{p:08x}");
+        assert!((channel(p, 0) - 0x40).abs() <= 1, "{p:08x}");
+        // Past the layer, known ground is as it is; unknown ground gets the flat fog.
+        assert_eq!(out[10 * v.width + 60], 0xFF00_8000);
+        let mut cache = TileCache::new(4);
+        compose(&v, &mut cache, &LOOK, Some(&fog), &mut out);
+        assert_eq!(out[10 * v.width + 60], fog.flat);
     }
 
     #[test]
@@ -1032,11 +1183,21 @@ mod tests {
                 round: false,
             };
             let mut out = vec![0u32; v.width * v.height];
-            compose(&v, &mut cache, &LOOK, Some(&Fog::default()), &mut out);
+            // A layer clear over a third of the view, see-through over a third and opaque over
+            // the rest, as over a map explored in the middle.
+            let grid = crate::fog::LayerGrid::for_view(&v);
+            let fog = FogLayer {
+                grid,
+                pixels: (0..grid.w * grid.h)
+                    .map(|i| [0, 0x8060_6060, 0xFFE0_E0E0][(i % grid.w) * 3 / grid.w])
+                    .collect(),
+                ..flat()
+            };
+            compose(&v, &mut cache, &LOOK, Some(&fog), &mut out);
             let runs = 20;
             let start = std::time::Instant::now();
             for _ in 0..runs {
-                compose(&v, &mut cache, &LOOK, Some(&Fog::default()), &mut out);
+                compose(&v, &mut cache, &LOOK, Some(&fog), &mut out);
             }
             let ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(runs);
             println!("compose 1024x576 at {zoom} px per block: {ms:.2} ms");

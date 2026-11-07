@@ -2,12 +2,13 @@
 //! `cargo run --release --example scene -- out.png [facing] [zoom]`
 
 use diorama_engine::chunk::{Blocks, ChunkSnapshot, ColumnTints, Light, Section};
+use diorama_engine::fog::FogRequest;
 use diorama_engine::looks::{self, Average, FaceColor, FaceTint, Kind, StateInput, TintKind};
 use diorama_engine::projection::Facing;
 use diorama_engine::session::{LOAD_DELAY, MapSession, SessionConfig};
 use diorama_engine::style::MapStyle;
 use diorama_engine::tile::TileKey;
-use diorama_engine::view::{Fog, Look, View, lod_for};
+use diorama_engine::view::{Look, View, lod_for};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -225,7 +226,7 @@ fn main() {
         s.compose(
             &view,
             &Look::new(false, false),
-            Some(&Fog::default()),
+            Some(&FogRequest { gui_zoom: zoom }),
             &mut out,
         );
         let (d, wt, b) = s.busy();
@@ -237,7 +238,7 @@ fn main() {
     s.compose(
         &view,
         &Look::new(false, false),
-        Some(&Fog::default()),
+        Some(&FogRequest { gui_zoom: zoom }),
         &mut out,
     );
     eprintln!("baked in {:.2?}", bake_started.elapsed());

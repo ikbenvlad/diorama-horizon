@@ -5,13 +5,16 @@
 use crate::baker::{self, BakeSettings};
 use crate::bakery::{BakeContext, Bakery};
 use crate::chunk::ChunkSnapshot;
+use crate::fog::{
+    self, FogJob, FogKind, FogLayer, FogParams, FogRequest, FogWorker, LayerGrid, MaskArea,
+};
 use crate::looks::BlockLooks;
 use crate::projection::{Facing, Projection, TILE_UNITS};
 use crate::source::{ChunkSource, LiveChunks};
 use crate::store::TileStore;
 use crate::style::MapStyle;
 use crate::tile::{Patches, TileKey};
-use crate::view::{self, Fog, Look, TileCache, View};
+use crate::view::{self, Look, TileCache, View};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -66,6 +69,32 @@ impl SessionConfig {
     }
 }
 
+/// The fog paint last asked for, and what it was for.
+struct FogSent {
+    kind: FogKind,
+    layer: i32,
+    lod: u8,
+    steps: u32,
+    fraction: f32,
+    rounded: bool,
+    coverage_version: u64,
+    night: f32,
+    grid: LayerGrid,
+    at: Instant,
+}
+
+/// The fog's painter and what it was last asked.
+struct FogState {
+    worker: Option<FogWorker>,
+    sent: Option<FogSent>,
+    started: Instant,
+    /// Tiles loaded only for their coverage, which the clouds' climb reads round the view.
+    wanted: HashSet<TileKey>,
+}
+
+/// A paint's cost by this much is the soonest the next is asked for, past [`fog::REFRESH`].
+const FOG_PACE: f32 = 1.5;
+
 struct Loader {
     requests: Sender<TileKey>,
     results: Receiver<(TileKey, Option<Arc<Vec<u32>>>)>,
@@ -97,6 +126,7 @@ pub struct MapSession {
     stand_ins: HashSet<TileKey>,
     generation: u64,
     player: (f64, f64),
+    fog: FogState,
 }
 
 impl MapSession {
@@ -140,6 +170,12 @@ impl MapSession {
             stand_ins: HashSet::new(),
             generation: 0,
             player: (0.0, 0.0),
+            fog: FogState {
+                worker: None,
+                sent: None,
+                started: Instant::now(),
+                wanted: HashSet::new(),
+            },
         }
     }
 
@@ -390,7 +426,12 @@ impl MapSession {
         }
         while let Ok((key, pixels)) = self.loader.results.try_recv() {
             self.loading.remove(&key);
+            let for_fog = self.fog.wanted.remove(&key);
             match pixels {
+                // Only its coverage, for the fog.
+                Some(p) if for_fog && !self.cache.contains(&key) => {
+                    self.cache.insert_coverage(key, TileCache::coverage_of(&p))
+                }
                 // A bake may have come in while it loaded: that one is newer. A stand-in gives way.
                 Some(p) if !self.cache.contains(&key) || self.stand_ins.remove(&key) => {
                     self.cache.insert_pixels(key, &p)
@@ -407,9 +448,137 @@ impl MapSession {
             for k in &set {
                 self.absent.remove(k);
             }
-            // Drawn overviews are reloaded as they're next drawn.
+            // Drawn overviews are reloaded as they're next drawn; those only the fog reads, now.
             self.cache.remove_where(|k| set.contains(k));
+            for k in set {
+                if self.cache.has_coverage(&k) && !self.cache.contains(&k) {
+                    self.want_coverage(k);
+                }
+            }
         }
+    }
+
+    /// The fog of `layer` in this dimension: a cave's, smoke under a roof, or clouds.
+    pub fn fog_kind(&self, layer: i32) -> FogKind {
+        FogKind::of(layer != TileKey::SURFACE, self.config.roof.is_some())
+    }
+
+    /// Asks the loader for a tile's coverage only, for the fog.
+    fn want_coverage(&mut self, key: TileKey) {
+        if self.loading.contains(&key) || self.absent.contains(&key) {
+            return;
+        }
+        if self.loader.requests.send(key).is_ok() {
+            self.loading.insert(key);
+            self.fog.wanted.insert(key);
+        }
+    }
+
+    /// Keeps the fog of `view` painting on its own thread: asks for a paint at once when the
+    /// tiles held changed, the view left the layer or the fog changed, and otherwise every
+    /// [`fog::REFRESH`] (or 1.5 times what a paint costs, if more) for the drift. Never waits.
+    /// The version of the layer there is to draw for the view, 0 for none yet: when it changes,
+    /// the view wants composing again.
+    pub fn fog_tick(
+        &mut self,
+        view: &View,
+        look: &Look,
+        request: &FogRequest,
+        now: Instant,
+    ) -> u64 {
+        let kind = self.fog_kind(view.layer);
+        let rounded = self.config.style.rounded_fog && kind != FogKind::Cave;
+        let (steps, fraction) = fog::fog_scale(request.gui_zoom);
+        let cost = self
+            .fog
+            .worker
+            .as_ref()
+            .map_or(Duration::ZERO, FogWorker::last_cost);
+        let interval = fog::REFRESH.max(cost.mul_f32(FOG_PACE));
+        let version = self.cache.version;
+        let due = self.fog.sent.as_ref().is_none_or(|s| {
+            s.kind != kind
+                || s.layer != view.layer
+                || s.lod != view.lod
+                || s.steps != steps
+                || s.fraction != fraction
+                || s.rounded != rounded
+                || s.coverage_version != version
+                || (s.night - look.night).abs() > 0.02
+                || !s.grid.holds(view)
+                || now.duration_since(s.at) >= interval
+        });
+        if due {
+            let grid = LayerGrid::for_view(view);
+            let area = MaskArea::around(&grid, view.layer, view.lod, kind, steps);
+            let (u0, v0, u1, v1) = area.bounds();
+            if kind == FogKind::Clouds {
+                // The clouds climb with distance from explored land past the view: what the
+                // overviews two levels up know of it.
+                let up = TileKey {
+                    layer: view.layer,
+                    u: 0,
+                    v: 0,
+                    lod: (view.lod + 2).min(TileKey::MAX_LOD),
+                };
+                let units = up.units();
+                for tv in (v0 / units).floor() as i32..=((v1 / units).floor() as i32) {
+                    for tu in (u0 / units).floor() as i32..=((u1 / units).floor() as i32) {
+                        let key = TileKey { u: tu, v: tv, ..up };
+                        if !self.cache.has_coverage(&key) {
+                            self.want_coverage(key);
+                        }
+                    }
+                }
+            }
+            let job = FogJob {
+                area,
+                kind,
+                rounded,
+                steps,
+                fraction,
+                coverage: self.cache.coverage_in(view.layer, u0, v0, u1, v1),
+                coverage_version: version,
+                grid,
+                params: FogParams {
+                    night: look.night,
+                    seconds: now.duration_since(self.fog.started).as_secs_f64(),
+                },
+            };
+            self.fog
+                .worker
+                .get_or_insert_with(FogWorker::new)
+                .submit(job);
+            self.fog.sent = Some(FogSent {
+                kind,
+                layer: view.layer,
+                lod: view.lod,
+                steps,
+                fraction,
+                rounded,
+                coverage_version: version,
+                night: look.night,
+                grid,
+                at: now,
+            });
+        }
+        self.fog_layer(view.layer).map_or(0, |l| l.version)
+    }
+
+    /// Whether the fog last painted for `layer` shows the tiles held now.
+    pub fn fog_ready(&self, layer: i32) -> bool {
+        self.fog_layer(layer)
+            .is_some_and(|l| l.coverage_version == self.cache.version)
+    }
+
+    /// The fog layer last painted for map layer `layer`, if it is of this dimension's fog there.
+    fn fog_layer(&self, layer: i32) -> Option<Arc<FogLayer>> {
+        let kind = self.fog_kind(layer);
+        self.fog
+            .worker
+            .as_ref()?
+            .latest()
+            .filter(|l| l.layer == layer && l.kind == kind)
     }
 
     /// The look of `layer` in this dimension: the backdrop of caves, of a dimension drawn from
@@ -419,9 +588,10 @@ impl MapSession {
     }
 
     /// Draws a view into `out` (ABGR pixels, `view.width * view.height`) as `look` has it, with
-    /// `fog` over unknown ground, asking for the tiles it lacks: from the store, or baked when
-    /// there are chunks to bake them from.
-    pub fn compose(&mut self, view: &View, look: &Look, fog: Option<&Fog>, out: &mut [u32]) {
+    /// the fog over unknown ground when `fog` asks for it (the last layer painted, see
+    /// [`Self::fog_tick`]), asking for the tiles it lacks: from the store, or baked when there are
+    /// chunks to bake them from.
+    pub fn compose(&mut self, view: &View, look: &Look, fog: Option<&FogRequest>, out: &mut [u32]) {
         if view.lod > 0 {
             for key in view.tiles() {
                 if !self.cache.contains(&key) {
@@ -429,9 +599,21 @@ impl MapSession {
                 }
             }
         }
-        let missing = view::compose(view, &mut self.cache, look, fog, out);
+        let layer = fog.map(|request| {
+            self.fog_tick(view, look, request, Instant::now());
+            self.fog_layer(view.layer).unwrap_or_else(|| {
+                Arc::new(FogLayer::flat(
+                    self.fog_kind(view.layer),
+                    view.layer,
+                    look.night,
+                ))
+            })
+        });
+        let missing = view::compose(view, &mut self.cache, look, layer.as_deref(), out);
         for key in missing {
             if self.loading.contains(&key) {
+                // Loading for the fog: wanted whole now.
+                self.fog.wanted.remove(&key);
                 continue;
             }
             if self.absent.contains(&key) {
@@ -577,6 +759,8 @@ mod tests {
     use crate::looks::tests::test_looks;
     use crate::view::lod_for;
 
+    const FOG: FogRequest = FogRequest { gui_zoom: 1.0 };
+
     #[test]
     fn bakes_loaded_chunks_and_draws_them() {
         let dir = std::env::temp_dir().join(format!("diorama-session-{}", std::process::id()));
@@ -613,25 +797,15 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             s.tick(Instant::now() + LOAD_DELAY, player);
-            s.compose(
-                &view,
-                &Look::new(false, false),
-                Some(&Fog::default()),
-                &mut out,
-            );
+            s.compose(&view, &Look::new(false, false), Some(&FOG), &mut out);
             let (d, w, b) = s.busy();
-            if d + w + b == 0 && s.cache_version() > 0 {
+            if d + w + b == 0 && s.cache_version() > 0 && s.fog_ready(view.layer) {
                 break;
             }
             assert!(Instant::now() < deadline, "bakes finish");
             std::thread::sleep(Duration::from_millis(20));
         }
-        s.compose(
-            &view,
-            &Look::new(false, false),
-            Some(&Fog::default()),
-            &mut out,
-        );
+        s.compose(&view, &Look::new(false, false), Some(&FOG), &mut out);
         let centre = out[48 * 96 + 48];
         assert_eq!(centre >> 24, 255);
         let (r, g, b) = (centre & 0xFF, (centre >> 8) & 0xFF, (centre >> 16) & 0xFF);
@@ -676,12 +850,7 @@ mod tests {
         };
         assert!(view.lod >= 1);
         let mut out = vec![0u32; 256];
-        s.compose(
-            &view,
-            &Look::new(false, false),
-            Some(&Fog::default()),
-            &mut out,
-        );
+        s.compose(&view, &Look::new(false, false), Some(&FOG), &mut out);
         assert_eq!(out[8 * 16 + 8], 0xFF00_FF00, "drawn from the level-0 tile");
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
@@ -692,11 +861,10 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             s.tick(Instant::now() + MAX_WAIT, player);
-            s.compose(view, &Look::new(false, false), Some(&Fog::default()), out);
+            s.compose(view, &Look::new(false, false), Some(&FOG), out);
             let (d, w, b) = s.busy();
-            if d + w + b == 0 && s.loading.is_empty() {
-                s.tick(Instant::now(), player);
-                s.compose(view, &Look::new(false, false), Some(&Fog::default()), out);
+            if d + w + b == 0 && s.loading.is_empty() && s.fog_ready(view.layer) {
+                s.compose(view, &Look::new(false, false), Some(&FOG), out);
                 return;
             }
             assert!(Instant::now() < deadline, "bakes finish");

@@ -10,6 +10,7 @@
 
 use super::Game;
 use diorama_engine::chunk::{Blocks, ChunkSnapshot, ColumnTints, Light, Section};
+use diorama_engine::fog::FogRequest;
 use diorama_engine::looks::{
     self, Average, BlockLooks, FaceColor, FaceTint, Kind, StateInput, TintKind,
 };
@@ -20,7 +21,7 @@ use diorama_engine::share;
 use diorama_engine::source::ChunkSource;
 use diorama_engine::style::MapStyle;
 use diorama_engine::tile::TileKey;
-use diorama_engine::view::{self, Fog, View};
+use diorama_engine::view::{self, View};
 use diorama_engine::waypoint::{self, Waypoint, Waypoints};
 use diorama_engine::waypoint_ui::{self as wui, Button, EditorHit, Form, ListHit, Rect};
 use horizon_client::extras::Corner;
@@ -49,8 +50,6 @@ const MAP_MIN_ZOOM: f64 = 0.04;
 const MAP_MAX_ZOOM: f64 = 16.0;
 /// Chunks sent to the converter per tick, nearest the player first.
 const CONVERT_PER_TICK: usize = 64;
-/// How often a view with fog in it is drawn again, for the drift.
-const FOG_FRAME: Duration = Duration::from_millis(100);
 /// How often the world is checked for chunks that came, changed or went.
 const TICK: Duration = Duration::from_millis(50);
 /// A waypoint pin's height in GUI pixels.
@@ -444,7 +443,8 @@ struct Shown {
     fullscreen: bool,
     view: View,
     cache_version: u64,
-    at: Instant,
+    /// The version of the fog layer drawn into it.
+    fog: u64,
     /// The GUI size it was made for.
     gui: [f32; 2],
 }
@@ -1476,14 +1476,13 @@ pub(super) fn frame(game: &mut Game<'_>, _elapsed: Duration) {
     let upload = with_state(game, |s| {
         let settings = s.settings;
         let underground = s.underground;
-        let time = now.duration_since(s.started).as_secs_f64();
         let own = s.session.as_mut()?;
         own.tick(now, [player.x, player.y, player.z]);
         let here = own.uv([player.x, player.y, player.z]);
         let cave = own
             .cave_layer()
             .filter(|_| s.viewing.is_none() || !fullscreen);
-        let view = if fullscreen {
+        let (view, gui_zoom) = if fullscreen {
             if s.map.follow && s.viewing.is_none() {
                 s.map.center = here;
             }
@@ -1500,7 +1499,7 @@ pub(super) fn frame(game: &mut Game<'_>, _elapsed: Duration) {
             } else {
                 TileKey::SURFACE
             };
-            View {
+            let view = View {
                 center_u: s.map.center.0,
                 center_v: s.map.center.1,
                 zoom,
@@ -1509,7 +1508,8 @@ pub(super) fn frame(game: &mut Game<'_>, _elapsed: Duration) {
                 width: w.max(1),
                 height: h.max(1),
                 round: false,
-            }
+            };
+            (view, s.map.zoom)
         } else {
             if !settings.minimap {
                 return None;
@@ -1522,7 +1522,7 @@ pub(super) fn frame(game: &mut Game<'_>, _elapsed: Duration) {
             } else {
                 TileKey::SURFACE
             };
-            View {
+            let view = View {
                 center_u: here.0,
                 center_v: here.1,
                 zoom,
@@ -1531,7 +1531,8 @@ pub(super) fn frame(game: &mut Game<'_>, _elapsed: Duration) {
                 width: side,
                 height: side,
                 round: settings.round,
-            }
+            };
+            (view, gui_zoom)
         };
         let session = match s.viewing.as_mut() {
             Some(v) if fullscreen => {
@@ -1540,30 +1541,25 @@ pub(super) fn frame(game: &mut Game<'_>, _elapsed: Duration) {
             }
             _ => s.session.as_mut()?,
         };
-        let version = session.cache_version();
-        let fresh = s.shown.as_ref().is_none_or(|sh| {
-            sh.fullscreen != fullscreen
-                || sh.view != view
-                || sh.cache_version != version
-                || now.duration_since(sh.at) >= FOG_FRAME
-                || sh.gui != gui_size
-        });
-        if !fresh {
-            return None;
-        }
-        let fog = if view.layer == TileKey::SURFACE {
-            Fog {
-                time,
-                ..Fog::default()
-            }
-        } else {
-            Fog { time, ..Fog::CAVE }
-        };
         // The minimap is as see-through as the settings say; the fullscreen map stays opaque
         // (MapViewport.java:133-140).
         let mut look = session.look(view.layer);
         if !fullscreen {
             look.opacity = settings.opacity();
+        }
+        // The fog paints on its own thread; the view is composed again when a new layer is in.
+        let fog = FogRequest { gui_zoom };
+        let fog_version = session.fog_tick(&view, &look, &fog, now);
+        let version = session.cache_version();
+        let fresh = s.shown.as_ref().is_none_or(|sh| {
+            sh.fullscreen != fullscreen
+                || sh.view != view
+                || sh.cache_version != version
+                || sh.fog != fog_version
+                || sh.gui != gui_size
+        });
+        if !fresh {
+            return None;
         }
         s.pixels.resize(view.width * view.height, 0);
         session.compose(&view, &look, Some(&fog), &mut s.pixels);
@@ -1572,7 +1568,7 @@ pub(super) fn frame(game: &mut Game<'_>, _elapsed: Duration) {
             fullscreen,
             view,
             cache_version: version,
-            at: now,
+            fog: fog_version,
             gui: gui_size,
         });
         Some((
