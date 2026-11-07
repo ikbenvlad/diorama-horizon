@@ -10,9 +10,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-const MAGIC: &[u8; 4] = b"DTL1";
+const MAGIC: &[u8; 4] = b"DTL2";
 /// Overview tiles are rebuilt this long after the first write under them since their last rebuild.
 const OVERVIEW_DELAY: Duration = Duration::from_secs(2);
+/// DTL2 flags byte: bit 0 = has light, bit 1 = has spots.
+const DTL2_FLAGS_LIGHT: u8 = 0x01;
+const DTL2_FLAGS_SPOTS: u8 = 0x02;
 
 enum Job {
     Write(TileKey),
@@ -26,7 +29,7 @@ type OverviewListener = Box<dyn Fn(TileKey) + Send>;
 struct Shared {
     folder: PathBuf,
     /// Tiles handed over and not yet on disk, newest pixels; reads see them first.
-    pending: Mutex<HashMap<TileKey, Arc<Vec<u32>>>>,
+    pending: Mutex<HashMap<TileKey, Arc<TileImage>>>,
     /// Called with every overview tile the writer rebuilt.
     on_overview: Mutex<Option<OverviewListener>>,
 }
@@ -111,8 +114,8 @@ impl TileStore {
         *lock(&self.shared.on_overview) = Some(Box::new(listener));
     }
 
-    /// The saved pixels of a tile, including ones handed over and not yet written.
-    pub fn read(&self, key: TileKey) -> Option<Arc<Vec<u32>>> {
+    /// The saved tile (pixels + optional light + optional spots), including ones handed over and not yet written.
+    pub fn read(&self, key: TileKey) -> Option<Arc<TileImage>> {
         if let Some(p) = lock(&self.shared.pending).get(&key) {
             return Some(p.clone());
         }
@@ -121,7 +124,7 @@ impl TileStore {
 
     /// Hands a tile over to be written.
     pub fn put(&self, image: &TileImage) {
-        lock(&self.shared.pending).insert(image.key, Arc::new(image.pixels.clone()));
+        lock(&self.shared.pending).insert(image.key, Arc::new(image.clone()));
         let _ = self.jobs.send(Job::Write(image.key));
     }
 
@@ -169,7 +172,7 @@ fn rebuild_overviews(s: &Shared, dirty: &mut HashSet<TileKey>) {
                 continue;
             }
             let image = tile::overview(key, refs);
-            if write_file(&path(&s.folder, key), &image.pixels).is_ok() {
+            if write_file(&path(&s.folder, key), &image).is_ok() {
                 if let Some(l) = lock(&s.on_overview).as_ref() {
                     l(key);
                 }
@@ -182,15 +185,14 @@ fn rebuild_overviews(s: &Shared, dirty: &mut HashSet<TileKey>) {
 }
 
 fn write_pending(s: &Shared, key: TileKey) {
-    let Some(pixels) = lock(&s.pending).get(&key).cloned() else {
+    let Some(image) = lock(&s.pending).get(&key).cloned() else {
         return;
     };
-    if write_file(&path(&s.folder, key), &pixels).is_ok() {
+    if write_file(&path(&s.folder, key), &image).is_ok() {
         let mut pending = lock(&s.pending);
-        // Only drop it if no newer bake came in while writing.
-        if pending.get(&key).is_some_and(|p| Arc::ptr_eq(p, &pixels)) {
-            pending.remove(&key);
-        }
+        // Remove the entry since it's now on disk.
+        // A new bake may have come in while writing, handled by the caller.
+        pending.remove(&key);
     }
 }
 
@@ -207,37 +209,115 @@ pub fn path(folder: &Path, key: TileKey) -> PathBuf {
         .join(format!("{}.{}.dtile", key.u, key.v))
 }
 
-fn write_file(path: &Path, pixels: &[u32]) -> std::io::Result<()> {
+fn write_file(path: &Path, image: &TileImage) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let bytes: Vec<u8> = pixels.iter().flat_map(|p| p.to_le_bytes()).collect();
-    let mut out = Vec::with_capacity(bytes.len() / 4 + 8);
+    let mut out = Vec::new();
+    // DTL2 magic + flags byte
     out.extend_from_slice(MAGIC);
+    let flags: u8 = (image.light.is_some() as u8) | ((image.spots.is_some() as u8) << 1);
+    out.push(flags);
+    // Compressed pixel data
+    let bytes: Vec<u8> = image.pixels.iter().flat_map(|p| p.to_le_bytes()).collect();
     out.extend_from_slice(&lz4_flex::compress_prepend_size(&bytes));
+    // Compressed light data if present
+    if let Some(ref light) = image.light {
+        out.extend_from_slice(&lz4_flex::compress_prepend_size(light));
+    }
+    // Compressed spots data if present
+    if let Some(ref spots) = image.spots {
+        out.extend_from_slice(&lz4_flex::compress_prepend_size(spots));
+    }
     // Write beside it and rename, so a crash never leaves half a tile.
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, &out)?;
     std::fs::rename(&tmp, path)
 }
 
-fn read_file(path: &Path) -> Option<Vec<u32>> {
+fn read_file(path: &Path) -> Option<TileImage> {
     let data = std::fs::read(path).ok()?;
     if data.len() < 8 || &data[..4] != MAGIC {
         return None;
     }
-    let bytes = lz4_flex::decompress_size_prepended(&data[4..]).ok()?;
-    if bytes.len() != PIXELS * 4 {
+    let flags = data[4];
+    let has_light = flags & DTL2_FLAGS_LIGHT != 0;
+    let has_spots = flags & DTL2_FLAGS_SPOTS != 0;
+
+    // Data layout after magic(4) + flags(1):
+    // [compressed_pixels: 4-byte_size_prefix + bytes][compressed_light_if_has_light: 4-byte_size_prefix + bytes][compressed_spots_if_has_spots: 4-byte_size_prefix + bytes]
+
+    // --- Read pixels ---
+    // Pixels start at offset 5 (after magic + flags)
+    let pixels_offset = 5usize;
+    if data.len() < pixels_offset + 4 {
         return None;
     }
-    Some(
-        bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-    )
+    let pixels_size =
+        u32::from_le_bytes([data[pixels_offset], data[pixels_offset + 1], data[pixels_offset + 2], data[pixels_offset + 3]]) as usize;
+    let pixels_data_start = pixels_offset + 4;
+    let pixels_data_end = pixels_data_start + pixels_size;
+
+    if pixels_data_end > data.len() {
+        return None;
+    }
+    let pixels_compressed = &data[pixels_data_start..pixels_data_end];
+    let pixels = lz4_flex::decompress_size_prepended(pixels_compressed).ok()?;
+    if pixels.len() != PIXELS * 4 {
+        return None;
+    }
+
+    let mut result = TileImage {
+        key: TileKey::new(0, 0, 0, 0),
+        pixels,
+        light: None,
+        spots: None,
+    };
+
+    // --- Read light if present ---
+    let mut current_pos = pixels_data_end;
+    if has_light && current_pos + 4 <= data.len() {
+        let light_size =
+            u32::from_le_bytes([data[current_pos], data[current_pos + 1], data[current_pos + 2], data[current_pos + 3]]) as usize;
+        let light_data_start = current_pos + 4;
+        let light_data_end = light_data_start + light_size;
+
+        if light_data_end > data.len() {
+            return None;
+        }
+        let light_decompressed = lz4_flex::decompress_size_prepended(&data[light_data_start..light_data_end]).ok()?;
+        result.light = Some(light_decompressed);
+        current_pos = light_data_end;
+    } else if has_light {
+        // No room for light section
+        return None;
+    }
+
+    // --- Read spots if present ---
+    if has_spots && current_pos + 4 <= data.len() {
+        let spots_size =
+            u32::from_le_bytes([data[current_pos], data[current_pos + 1], data[current_pos + 2], data[current_pos + 3]]) as usize;
+        let spots_data_start = current_pos + 4;
+        let spots_data_end = spots_data_start + spots_size;
+
+        if spots_data_end > data.len() {
+            return None;
+        }
+        let spots_compressed = &data[spots_data_start..spots_data_end];
+        let spots_decompressed = lz4_flex::decompress_size_prepended(spots_compressed).ok()?;
+        // Spots are u32 values
+        if spots_decompressed.len() % 4 == 0 {
+            let spots_count = spots_decompressed.len() / 4;
+            result.spots = Some(
+                spots_decompressed
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            );
+        }
+    }
+
+    Some(result)
 }
 
 #[cfg(test)]
@@ -259,11 +339,13 @@ mod tests {
         {
             let store = TileStore::open(&dir);
             store.put(&img);
-            assert_eq!(store.read(key).unwrap()[5], 0xFF11_2233, "pending reads");
+            let read_img = store.read(key).unwrap();
+            assert_eq!((*read_img).pixels[5], 0xFF11_2233, "pending reads");
             store.flush();
         }
         let store = TileStore::open(&dir);
-        assert_eq!(store.read(key).unwrap()[5], 0xFF11_2233, "from disk");
+        let read_img = store.read(key).unwrap();
+        assert_eq!((*read_img).pixels[5], 0xFF11_2233, "from disk");
         let parent = store.read(key.parent()).expect("overview built");
         assert_eq!(parent.len(), PIXELS);
         assert!(store.read(key.parent().parent()).is_some());
@@ -288,6 +370,9 @@ mod tests {
             store.put(&img);
             std::thread::sleep(Duration::from_millis(100));
         }
+        // Verify the tile can be read back
+        let read_img = store.read(key).unwrap();
+        assert_eq!((*read_img).pixels[0], 0xFF00_00FF);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

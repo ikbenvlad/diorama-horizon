@@ -1464,6 +1464,32 @@ pub(crate) mod tests {
         assert!(baked > 0);
     }
 
+    /// Times whole-tile bakes of a flat world with a tower, four samples a pixel:
+    /// `cargo test --release -- --ignored bake_speed --nocapture`.
+    #[test]
+    #[ignore]
+    fn bake_speed() {
+        let world = flat_world(6, true);
+        let looks = test_looks();
+        let s = BakeSettings {
+            fast: false,
+            ..settings(Facing::North)
+        };
+        let (key, _) = pixel_of(&s.projection, 0.5, 64.0, 0.5);
+        Baker::bake(key, &world, &looks, &s);
+        let mut times = Vec::new();
+        for _ in 0..7 {
+            let start = std::time::Instant::now();
+            std::hint::black_box(Baker::bake(key, &world, &looks, &s));
+            times.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        times.sort_by(f64::total_cmp);
+        println!(
+            "bake 512x512, 4 samples: median {:.1} ms, best {:.1} ms",
+            times[3], times[0]
+        );
+    }
+
     #[test]
     fn noise_is_stable() {
         assert_eq!(block_noise(1, 2, 3), block_noise(1, 2, 3));
